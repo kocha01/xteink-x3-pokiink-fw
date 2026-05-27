@@ -1,0 +1,1640 @@
+#include "GfxRenderer.h"
+
+#include <algorithm>
+#include <FontDecompressor.h>
+#include <Logging.h>
+#include <SdCardFont.h>
+#include <Utf8.h>
+
+#include <limits>
+
+#include "FontCacheManager.h"
+
+const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const {
+  if (fontData->groups != nullptr) {
+    auto* fd = fontCacheManager_ ? fontCacheManager_->getDecompressor() : nullptr;
+    if (!fd) {
+      LOG_ERR("GFX", "Compressed font but no FontDecompressor set");
+      return nullptr;
+    }
+    uint32_t glyphIndex = static_cast<uint32_t>(glyph - fontData->glyph);
+    // For page-buffer hits the pointer is stable for the page lifetime.
+    // For hot-group hits it is valid only until the next getBitmap() call — callers
+    // must consume it (draw the glyph) before requesting another bitmap.
+    return fd->getBitmap(fontData, glyph, glyphIndex);
+  }
+  // SD card fonts: glyphMissHandler may have populated the overflow ring buffer
+  // with on-demand glyphs whose bitmap pointer is NOT inside fontData->bitmap.
+  // Detect via isOverflowGlyph() and route the bitmap fetch through SdCardFont.
+  if (fontData->glyphMissCtx) {
+    auto* sdFont = SdCardFont::fromMissCtx(fontData->glyphMissCtx);
+    if (sdFont->isOverflowGlyph(glyph)) {
+      return sdFont->getOverflowBitmap(glyph);  // may be nullptr for zero-width glyphs
+    }
+  }
+  return &fontData->bitmap[glyph->dataOffset];
+}
+
+void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text) const {
+  auto it = sdCardFonts_.find(fontId);
+  if (it != sdCardFonts_.end()) {
+    // Metadata-only: loads glyph metrics (advanceX) without bitmap data.
+    // Saves ~50-100KB heap vs full prewarm — layout only needs advance widths.
+    int missed = it->second->prewarm(utf8Text, 0x0F, /*metadataOnly=*/true);
+    if (missed > 0) {
+      LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
+    }
+  }
+}
+
+void GfxRenderer::begin() {
+  frameBuffer = display.getFrameBuffer();
+  if (!frameBuffer) {
+    LOG_ERR("GFX", "!! No framebuffer");
+    assert(false);
+  }
+}
+
+void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) { fontMap.insert({fontId, font}); }
+
+// Translate logical (x,y) coordinates to physical panel coordinates based on current orientation
+// This should always be inlined for better performance
+static inline void rotateCoordinates(const GfxRenderer::Orientation orientation, const int x, const int y, int* phyX,
+                                     int* phyY) {
+  switch (orientation) {
+    case GfxRenderer::Portrait: {
+      // Logical portrait (480x800) → panel (800x480)
+      // Rotation: 90 degrees clockwise
+      *phyX = y;
+      *phyY = HalDisplay::DISPLAY_HEIGHT - 1 - x;
+      break;
+    }
+    case GfxRenderer::LandscapeClockwise: {
+      // Logical landscape (800x480) rotated 180 degrees (swap top/bottom and left/right)
+      *phyX = HalDisplay::DISPLAY_WIDTH - 1 - x;
+      *phyY = HalDisplay::DISPLAY_HEIGHT - 1 - y;
+      break;
+    }
+    case GfxRenderer::PortraitInverted: {
+      // Logical portrait (480x800) → panel (800x480)
+      // Rotation: 90 degrees counter-clockwise
+      *phyX = HalDisplay::DISPLAY_WIDTH - 1 - y;
+      *phyY = x;
+      break;
+    }
+    case GfxRenderer::LandscapeCounterClockwise: {
+      // Logical landscape (800x480) aligned with panel orientation
+      *phyX = x;
+      *phyY = y;
+      break;
+    }
+  }
+}
+
+enum class TextRotation { None, Rotated90CW };
+
+static inline int getCombiningAnchorX(const int32_t cursorXFP, const int lastBaseX, const int lastBaseAdvanceFP,
+                                      const uint32_t cp) {
+  if (utf8IsThaiCombiningMark(cp)) {
+    // Thai fonts often encode upper marks with zero advance and a negative left
+    // bearing, expecting placement from the post-base pen position.
+    return fp4::toPixel(cursorXFP);
+  }
+  return lastBaseX + fp4::toPixel(lastBaseAdvanceFP / 2);
+}
+
+static inline int getCombiningAnchorYRotated(const int32_t cursorYFP, const int lastBaseY, const int lastBaseAdvanceFP,
+                                             const uint32_t cp) {
+  if (utf8IsThaiCombiningMark(cp)) {
+    return fp4::toPixel(cursorYFP);
+  }
+  return lastBaseY - fp4::toPixel(lastBaseAdvanceFP / 2);
+}
+
+/// Check whether the font's Unicode intervals include the Thai block (U+0E00–U+0E7F).
+static inline bool fontHasThaiIntervals(const EpdFontData* fontData) {
+  for (uint32_t i = 0; i < fontData->intervalCount; i++) {
+    if (fontData->intervals[i].first <= 0x0E7F && fontData->intervals[i].last >= 0x0E00) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline bool fontNeedsThaiUpperRestacking(const EpdFontData* fontData) {
+  if (!fontData) {
+    return false;
+  }
+  // Apply Thai upper-mark restacking to any font that contains Thai glyphs.
+  // The restacking logic only raises level-3 marks (tone marks) when they
+  // actually overlap a previously placed level-2 mark — fonts that already
+  // position marks correctly (e.g. CloudLoop) are unaffected.
+  return fontHasThaiIntervals(fontData);
+}
+
+static inline void applyThaiUpperStacking(const EpdFontData* fontData, const uint32_t cp, const EpdGlyph* glyph,
+                                          const int penY, int* raiseBy, int* stackedUpperMaxY,
+                                          bool* hasStackedUpper) {
+  if (!fontNeedsThaiUpperRestacking(fontData)) {
+    return;
+  }
+
+  if (!glyph || !utf8IsThaiUpperCombiningMark(cp)) {
+    return;
+  }
+
+  // Y-up coordinate system: higher values = higher on screen (above baseline).
+  // glyphMaxY = top edge of the glyph, glyphMinY = bottom edge.
+  int glyphMinY = penY - *raiseBy + glyph->top - glyph->height;
+  int glyphMaxY = penY - *raiseBy + glyph->top;
+
+  if (utf8IsThaiUpperLevelThreeMark(cp) && *hasStackedUpper) {
+    // Level-3 mark (tone mark) must sit above the top edge of the level-2 mark
+    // with at least MIN_STACK_GAP_PX pixels of clearance.
+    const int MIN_STACK_GAP_PX = std::max(1, static_cast<int>(fontData->advanceY) / 10);
+    const int desiredMinY = *stackedUpperMaxY + MIN_STACK_GAP_PX;
+    if (glyphMinY < desiredMinY) {
+      const int extraRaise = desiredMinY - glyphMinY;
+      *raiseBy += extraRaise;
+      glyphMinY += extraRaise;
+      glyphMaxY += extraRaise;
+    }
+  }
+
+  if (utf8IsThaiUpperLevelTwoMark(cp) || utf8IsThaiUpperLevelThreeMark(cp)) {
+    *stackedUpperMaxY = *hasStackedUpper ? std::max(*stackedUpperMaxY, glyphMaxY) : glyphMaxY;
+    *hasStackedUpper = true;
+  }
+}
+
+static inline const EpdFontFamily* resolveFallbackFont(const GfxRenderer& renderer, const int fontId,
+                                                       const EpdFontFamily& primaryFont) {
+  const EpdFontFamily* fallbackFont = renderer.getFallbackFont(fontId);
+  if (!fallbackFont || fallbackFont == &primaryFont) {
+    return nullptr;
+  }
+  return fallbackFont;
+}
+
+// Shared glyph rendering logic for normal and rotated text.
+// Coordinate mapping and cursor advance direction are selected at compile time via the template parameter.
+template <TextRotation rotation>
+static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
+                           const EpdFontFamily& fontFamily, const EpdFontFamily* fallbackFont,
+                           const EpdFontFamily* secondaryFallbackFont, const uint32_t cp, int cursorX, int cursorY,
+                           const bool pixelState, const EpdFontFamily::Style style) {
+  const EpdFontFamily* usedFont = &fontFamily;
+  const EpdGlyph* glyph = nullptr;
+
+  // Try fallback fonts if primary font doesn't natively have this glyph
+  // (avoids replacement glyph ◆ when a fallback font has the real glyph)
+  if (!fontFamily.hasNativeGlyph(cp, style)) {
+    if (fallbackFont) {
+      glyph = fallbackFont->getGlyph(cp, style);
+      if (glyph) usedFont = fallbackFont;
+    }
+    if (!glyph && secondaryFallbackFont) {
+      glyph = secondaryFallbackFont->getGlyph(cp, style);
+      if (glyph) usedFont = secondaryFallbackFont;
+    }
+  }
+  if (!glyph) {
+    glyph = fontFamily.getGlyph(cp, style);
+  }
+  if (!glyph) {
+    LOG_ERR("GFX", "No glyph for codepoint %d", cp);
+    return;
+  }
+
+  const EpdFontData* fontData = usedFont->getData(style);
+  const bool is2Bit = fontData->is2Bit;
+  const uint8_t width = glyph->width;
+  const uint8_t height = glyph->height;
+  const int left = glyph->left;
+  const int top = glyph->top;
+
+  const uint8_t* bitmap = renderer.getGlyphBitmap(fontData, glyph);
+
+  if (bitmap != nullptr) {
+    // For Normal:  outer loop advances screenY, inner loop advances screenX
+    // For Rotated: outer loop advances screenX, inner loop advances screenY (in reverse)
+    int outerBase, innerBase;
+    if constexpr (rotation == TextRotation::Rotated90CW) {
+      outerBase = cursorX + fontData->ascender - top;  // screenX = outerBase + glyphY
+      innerBase = cursorY - left;                      // screenY = innerBase - glyphX
+    } else {
+      outerBase = cursorY - top;   // screenY = outerBase + glyphY
+      innerBase = cursorX + left;  // screenX = innerBase + glyphX
+    }
+
+    if (is2Bit) {
+      int pixelPosition = 0;
+      for (int glyphY = 0; glyphY < height; glyphY++) {
+        const int outerCoord = outerBase + glyphY;
+        for (int glyphX = 0; glyphX < width; glyphX++, pixelPosition++) {
+          int screenX, screenY;
+          if constexpr (rotation == TextRotation::Rotated90CW) {
+            screenX = outerCoord;
+            screenY = innerBase - glyphX;
+          } else {
+            screenX = innerBase + glyphX;
+            screenY = outerCoord;
+          }
+
+          const uint8_t byte = bitmap[pixelPosition >> 2];
+          const uint8_t bit_index = (3 - (pixelPosition & 3)) * 2;
+          // the direct bit from the font is 0 -> white, 1 -> light gray, 2 -> dark gray, 3 -> black
+          // we swap this to better match the way images and screen think about colors:
+          // 0 -> black, 1 -> dark grey, 2 -> light grey, 3 -> white
+          const uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
+
+          if (renderMode == GfxRenderer::BW && bmpVal < 3) {
+            // Black (also paints over the grays in BW mode)
+            renderer.drawPixel(screenX, screenY, pixelState);
+          } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (bmpVal == 1 || bmpVal == 2)) {
+            // Light gray (also mark the MSB if it's going to be a dark gray too)
+            // We have to flag pixels in reverse for the gray buffers, as 0 leave alone, 1 update
+            renderer.drawPixel(screenX, screenY, false);
+          } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && bmpVal == 1) {
+            // Dark gray
+            renderer.drawPixel(screenX, screenY, false);
+          }
+        }
+      }
+    } else {
+      int pixelPosition = 0;
+      for (int glyphY = 0; glyphY < height; glyphY++) {
+        const int outerCoord = outerBase + glyphY;
+        for (int glyphX = 0; glyphX < width; glyphX++, pixelPosition++) {
+          int screenX, screenY;
+          if constexpr (rotation == TextRotation::Rotated90CW) {
+            screenX = outerCoord;
+            screenY = innerBase - glyphX;
+          } else {
+            screenX = innerBase + glyphX;
+            screenY = outerCoord;
+          }
+
+          const uint8_t byte = bitmap[pixelPosition >> 3];
+          const uint8_t bit_index = 7 - (pixelPosition & 7);
+
+          if ((byte >> bit_index) & 1) {
+            renderer.drawPixel(screenX, screenY, pixelState);
+          }
+        }
+      }
+    }
+  }
+}
+
+// IMPORTANT: This function is in critical rendering path and is called for every pixel. Please keep it as simple and
+// efficient as possible.
+void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
+#ifdef CROSSPOINT_EMULATED
+  if (debugTextBoundsActive_) {
+    debugTextBoundsMinX_ = std::min(debugTextBoundsMinX_, x);
+    debugTextBoundsMaxX_ = std::max(debugTextBoundsMaxX_, x);
+    debugTextBoundsMinY_ = std::min(debugTextBoundsMinY_, y);
+    debugTextBoundsMaxY_ = std::max(debugTextBoundsMaxY_, y);
+  }
+#endif
+
+  int phyX = 0;
+  int phyY = 0;
+
+  // Note: this call should be inlined for better performance
+  rotateCoordinates(orientation, x, y, &phyX, &phyY);
+
+  // Bounds checking against physical panel dimensions
+  if (phyX < 0 || phyX >= HalDisplay::DISPLAY_WIDTH || phyY < 0 || phyY >= HalDisplay::DISPLAY_HEIGHT) {
+    LOG_ERR("GFX", "!! Outside range (%d, %d) -> (%d, %d)", x, y, phyX, phyY);
+    return;
+  }
+
+  // Calculate byte position and bit position
+  const uint16_t byteIndex = phyY * HalDisplay::DISPLAY_WIDTH_BYTES + (phyX / 8);
+  const uint8_t bitPosition = 7 - (phyX % 8);  // MSB first
+
+  if (state) {
+    frameBuffer[byteIndex] &= ~(1 << bitPosition);  // Clear bit
+  } else {
+    frameBuffer[byteIndex] |= 1 << bitPosition;  // Set bit
+  }
+}
+
+int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontFamily::Style style) const {
+  // Use getTextAdvanceX which supports fallback font for missing glyphs (e.g. Thai in UI fonts)
+  if (getFallbackFont(fontId)) {
+    return getTextAdvanceX(fontId, text, style);
+  }
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+
+  int w = 0, h = 0;
+  fontIt->second.getTextDimensions(text, &w, &h, style);
+  return w;
+}
+
+void GfxRenderer::drawCenteredText(const int fontId, const int y, const char* text, const bool black,
+                                   const EpdFontFamily::Style style) const {
+  const int x = (getScreenWidth() - getTextWidth(fontId, text, style)) / 2;
+  drawText(fontId, x, y, text, black, style);
+}
+
+void GfxRenderer::drawText(const int fontId, const int x, const int y, const char* text, const bool black,
+                           const EpdFontFamily::Style style) const {
+  const int yPos = y + getFontAscenderSize(fontId);
+  int32_t xPosFP = fp4::fromPixel(x);  // 12.4 fixed-point accumulator
+  int lastBaseX = x;
+  int lastBaseAdvanceFP = 0;  // 12.4 fixed-point
+  int lastBaseTop = 0;
+
+#ifdef CROSSPOINT_EMULATED
+  const int expectedFitWidth = getTextFitWidth(fontId, text, style);
+  debugTextBoundsActive_ = true;
+  debugTextBoundsMinX_ = std::numeric_limits<int>::max();
+  debugTextBoundsMaxX_ = std::numeric_limits<int>::min();
+  debugTextBoundsMinY_ = std::numeric_limits<int>::max();
+  debugTextBoundsMaxY_ = std::numeric_limits<int>::min();
+  debugTextExpectedRight_ = x + expectedFitWidth;
+  debugTextSample_.assign(text);
+#endif
+
+  // cannot draw a NULL / empty string
+  if (text == nullptr || *text == '\0') {
+#ifdef CROSSPOINT_EMULATED
+    debugTextBoundsActive_ = false;
+    debugTextSample_.clear();
+#endif
+    return;
+  }
+
+  if (fontCacheManager_ && fontCacheManager_->isScanning()) {
+    fontCacheManager_->recordText(text, fontId, style);
+#ifdef CROSSPOINT_EMULATED
+    debugTextBoundsActive_ = false;
+    debugTextSample_.clear();
+#endif
+    return;
+  }
+
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+#ifdef CROSSPOINT_EMULATED
+    debugTextBoundsActive_ = false;
+    debugTextSample_.clear();
+#endif
+    return;
+  }
+  const auto& font = fontIt->second;
+
+  // Faux bold: if bold requested but font has no native bold variant,
+  // draw text twice (at x and x+1) with regular style to simulate bold.
+  // No extra RAM needed — just two draw passes.
+  if ((style & EpdFontFamily::BOLD) != 0 && !font.hasNativeBold()) {
+    const auto regularStyle = static_cast<EpdFontFamily::Style>(style & ~EpdFontFamily::BOLD);
+    drawText(fontId, x, y, text, black, regularStyle);
+    drawText(fontId, x + 1, y, text, black, regularStyle);
+    return;
+  }
+
+  const EpdFontFamily* fallbackFont = resolveFallbackFont(*this, fontId, font);
+  const EpdFontFamily* secondaryFallbackFont = getSecondaryFallbackFont(fontId);
+  constexpr int MIN_COMBINING_GAP_PX = 1;
+  int stackedThaiUpperMaxY = 0;
+  bool hasStackedThaiUpper = false;
+
+  uint32_t cp;
+  uint32_t prevCp = 0;
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
+    if (utf8IsCombiningMark(cp)) {
+      const EpdFontData* combiningFontData = font.getData(style);
+      const EpdGlyph* combiningGlyph = font.getGlyph(cp, style);
+      if (!combiningGlyph && fallbackFont) {
+        combiningGlyph = fallbackFont->getGlyph(cp, style);
+        if (combiningGlyph) {
+          combiningFontData = fallbackFont->getData(style);
+        }
+      }
+      if (!combiningGlyph && secondaryFallbackFont) {
+        combiningGlyph = secondaryFallbackFont->getGlyph(cp, style);
+        if (combiningGlyph) {
+          combiningFontData = secondaryFallbackFont->getData(style);
+        }
+      }
+      int raiseBy = 0;
+      if (combiningGlyph) {
+        // Gap enforcement rules:
+        // - Lower Thai marks (U+0E38-0E3A): never raise — designed to sit below.
+        // - Level-2 upper Thai marks (ั ิ ี ึ ื ็ ํ): designed to sit between
+        //   consonant strokes (e.g. ั between the loops of ป). Intentional overlap
+        //   with the consonant top — skip enforcement, trust the font metrics.
+        // - All other marks (level-3 tone marks ่ ้ ๊ ๋, and non-Thai): enforce
+        //   a minimum 1px gap above the consonant/stack top.
+        if (!utf8IsThaiLowerCombiningMark(cp) && !utf8IsThaiUpperLevelTwoMark(cp)) {
+          const int currentGap = combiningGlyph->top - combiningGlyph->height - lastBaseTop;
+          if (currentGap < MIN_COMBINING_GAP_PX) {
+            raiseBy = MIN_COMBINING_GAP_PX - currentGap;
+          }
+        }
+        // Sara Am lookahead: if this is a level-3 tone mark (่ ้ ๊ ๋) and the next
+        // codepoint is ำ (U+0E33), ำ carries an implicit level-2 upper component (◌ั).
+        // Pre-set hasStackedThaiUpper so applyThaiUpperStacking raises the tone mark
+        // above ำ's upper part instead of letting it sink into it (the "จม" problem).
+        if (utf8IsThaiUpperLevelThreeMark(cp) && !hasStackedThaiUpper) {
+          const unsigned char* peekPtr = reinterpret_cast<const unsigned char*>(text);
+          const uint32_t peekCp = utf8NextCodepoint(&peekPtr);
+          if (peekCp == 0x0E33) {  // sara am (ำ) follows
+            const EpdGlyph* saraAmGlyph = font.getGlyph(0x0E33, style);
+            if (!saraAmGlyph && fallbackFont) saraAmGlyph = fallbackFont->getGlyph(0x0E33, style);
+            if (!saraAmGlyph && secondaryFallbackFont) saraAmGlyph = secondaryFallbackFont->getGlyph(0x0E33, style);
+            if (saraAmGlyph) {
+              stackedThaiUpperMaxY = yPos + saraAmGlyph->top;
+              hasStackedThaiUpper = true;
+            }
+          }
+        }
+        applyThaiUpperStacking(combiningFontData, cp, combiningGlyph, yPos, &raiseBy, &stackedThaiUpperMaxY,
+                               &hasStackedThaiUpper);
+      }
+
+      const int combiningX = getCombiningAnchorX(xPosFP, lastBaseX, lastBaseAdvanceFP, cp);
+      const int combiningY = yPos - raiseBy;
+      renderCharImpl<TextRotation::None>(*this, renderMode, font, fallbackFont, secondaryFallbackFont, cp, combiningX,
+                                         combiningY, black, style);
+      continue;
+    }
+
+    cp = font.applyLigatures(cp, text, style);
+    const int kernFP = (prevCp != 0) ? font.getKerning(prevCp, cp, style) : 0;  // 4.4 fixed-point kern
+    xPosFP += kernFP;
+
+    lastBaseX = fp4::toPixel(xPosFP);  // snap 12.4 fixed-point to nearest pixel
+    const EpdGlyph* glyph = font.hasNativeGlyph(cp, style) ? font.getGlyph(cp, style) : nullptr;
+    if (!glyph && fallbackFont) {
+      glyph = fallbackFont->getGlyph(cp, style);
+    }
+    if (!glyph && secondaryFallbackFont) {
+      glyph = secondaryFallbackFont->getGlyph(cp, style);
+    }
+    if (!glyph) {
+      glyph = font.getGlyph(cp, style);  // Fall back to replacement glyph
+    }
+
+    lastBaseAdvanceFP = glyph ? glyph->advanceX : 0;
+    lastBaseTop = glyph ? glyph->top : 0;
+    hasStackedThaiUpper = false;
+
+    renderCharImpl<TextRotation::None>(*this, renderMode, font, fallbackFont, secondaryFallbackFont, cp, lastBaseX,
+                                       yPos, black, style);
+    if (glyph) {
+      xPosFP += glyph->advanceX;  // 12.4 fixed-point advance
+    }
+    prevCp = cp;
+  }
+
+#ifdef CROSSPOINT_EMULATED
+  if (debugTextBoundsMinX_ != std::numeric_limits<int>::max() &&
+      (debugTextBoundsMaxX_ >= getScreenWidth() || debugTextBoundsMaxX_ > debugTextExpectedRight_ + 2)) {
+    LOG_ERR("GFX",
+            "Text overflow sample='%s' x=%d y=%d fitWidth=%d expectedRight=%d actualBounds=[%d,%d]-[%d,%d] "
+            "screen=%dx%d",
+            debugTextSample_.c_str(), x, y, expectedFitWidth, debugTextExpectedRight_, debugTextBoundsMinX_,
+            debugTextBoundsMinY_, debugTextBoundsMaxX_, debugTextBoundsMaxY_, getScreenWidth(), getScreenHeight());
+  }
+  debugTextBoundsActive_ = false;
+  debugTextSample_.clear();
+#endif
+}
+
+void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const bool state) const {
+  if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
+  if (x1 == x2) {
+    if (y2 < y1) {
+      std::swap(y1, y2);
+    }
+    for (int y = y1; y <= y2; y++) {
+      drawPixel(x1, y, state);
+    }
+  } else if (y1 == y2) {
+    if (x2 < x1) {
+      std::swap(x1, x2);
+    }
+    for (int x = x1; x <= x2; x++) {
+      drawPixel(x, y1, state);
+    }
+  } else {
+    // Bresenham's line algorithm — integer arithmetic only
+    int dx = x2 - x1;
+    int dy = y2 - y1;
+    int sx = (dx > 0) ? 1 : -1;
+    int sy = (dy > 0) ? 1 : -1;
+    dx = sx * dx;  // abs
+    dy = sy * dy;  // abs
+
+    int err = dx - dy;
+    while (true) {
+      drawPixel(x1, y1, state);
+      if (x1 == x2 && y1 == y2) break;
+      int e2 = 2 * err;
+      if (e2 > -dy) {
+        err -= dy;
+        x1 += sx;
+      }
+      if (e2 < dx) {
+        err += dx;
+        y1 += sy;
+      }
+    }
+  }
+}
+
+void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const int lineWidth, const bool state) const {
+  for (int i = 0; i < lineWidth; i++) {
+    drawLine(x1, y1 + i, x2, y2 + i, state);
+  }
+}
+
+void GfxRenderer::drawRect(const int x, const int y, const int width, const int height, const bool state) const {
+  drawLine(x, y, x + width - 1, y, state);
+  drawLine(x + width - 1, y, x + width - 1, y + height - 1, state);
+  drawLine(x + width - 1, y + height - 1, x, y + height - 1, state);
+  drawLine(x, y, x, y + height - 1, state);
+}
+
+// Border is inside the rectangle
+void GfxRenderer::drawRect(const int x, const int y, const int width, const int height, const int lineWidth,
+                           const bool state) const {
+  for (int i = 0; i < lineWidth; i++) {
+    drawLine(x + i, y + i, x + width - i, y + i, state);
+    drawLine(x + width - i, y + i, x + width - i, y + height - i, state);
+    drawLine(x + width - i, y + height - i, x + i, y + height - i, state);
+    drawLine(x + i, y + height - i, x + i, y + i, state);
+  }
+}
+
+void GfxRenderer::drawArc(const int maxRadius, const int cx, const int cy, const int xDir, const int yDir,
+                          const int lineWidth, const bool state) const {
+  const int stroke = std::min(lineWidth, maxRadius);
+  const int innerRadius = std::max(maxRadius - stroke, 0);
+  const int outerRadiusSq = maxRadius * maxRadius;
+  const int innerRadiusSq = innerRadius * innerRadius;
+  for (int dy = 0; dy <= maxRadius; ++dy) {
+    for (int dx = 0; dx <= maxRadius; ++dx) {
+      const int distSq = dx * dx + dy * dy;
+      if (distSq > outerRadiusSq || distSq < innerRadiusSq) {
+        continue;
+      }
+      const int px = cx + xDir * dx;
+      const int py = cy + yDir * dy;
+      drawPixel(px, py, state);
+    }
+  }
+};
+
+// Border is inside the rectangle, rounded corners
+void GfxRenderer::drawRoundedRect(const int x, const int y, const int width, const int height, const int lineWidth,
+                                  const int cornerRadius, bool state) const {
+  drawRoundedRect(x, y, width, height, lineWidth, cornerRadius, true, true, true, true, state);
+}
+
+// Border is inside the rectangle, rounded corners
+void GfxRenderer::drawRoundedRect(const int x, const int y, const int width, const int height, const int lineWidth,
+                                  const int cornerRadius, bool roundTopLeft, bool roundTopRight, bool roundBottomLeft,
+                                  bool roundBottomRight, bool state) const {
+  if (lineWidth <= 0 || width <= 0 || height <= 0) {
+    return;
+  }
+
+  const int maxRadius = std::min({cornerRadius, width / 2, height / 2});
+  if (maxRadius <= 0) {
+    drawRect(x, y, width, height, lineWidth, state);
+    return;
+  }
+
+  const int stroke = std::min(lineWidth, maxRadius);
+  const int right = x + width - 1;
+  const int bottom = y + height - 1;
+
+  const int horizontalWidth = width - 2 * maxRadius;
+  if (horizontalWidth > 0) {
+    if (roundTopLeft || roundTopRight) {
+      fillRect(x + maxRadius, y, horizontalWidth, stroke, state);
+    }
+    if (roundBottomLeft || roundBottomRight) {
+      fillRect(x + maxRadius, bottom - stroke + 1, horizontalWidth, stroke, state);
+    }
+  }
+
+  const int verticalHeight = height - 2 * maxRadius;
+  if (verticalHeight > 0) {
+    if (roundTopLeft || roundBottomLeft) {
+      fillRect(x, y + maxRadius, stroke, verticalHeight, state);
+    }
+    if (roundTopRight || roundBottomRight) {
+      fillRect(right - stroke + 1, y + maxRadius, stroke, verticalHeight, state);
+    }
+  }
+
+  if (roundTopLeft) {
+    drawArc(maxRadius, x + maxRadius, y + maxRadius, -1, -1, lineWidth, state);
+  }
+  if (roundTopRight) {
+    drawArc(maxRadius, right - maxRadius, y + maxRadius, 1, -1, lineWidth, state);
+  }
+  if (roundBottomRight) {
+    drawArc(maxRadius, right - maxRadius, bottom - maxRadius, 1, 1, lineWidth, state);
+  }
+  if (roundBottomLeft) {
+    drawArc(maxRadius, x + maxRadius, bottom - maxRadius, -1, 1, lineWidth, state);
+  }
+}
+
+void GfxRenderer::fillRect(const int x, const int y, const int width, const int height, const bool state) const {
+  for (int fillY = y; fillY < y + height; fillY++) {
+    drawLine(x, fillY, x + width - 1, fillY, state);
+  }
+}
+
+// NOTE: Those are in critical path, and need to be templated to avoid runtime checks for every pixel.
+// Any branching must be done outside the loops to avoid performance degradation.
+template <>
+void GfxRenderer::drawPixelDither<Color::Clear>(const int x, const int y) const {
+  // Do nothing
+}
+
+template <>
+void GfxRenderer::drawPixelDither<Color::Black>(const int x, const int y) const {
+  drawPixel(x, y, true);
+}
+
+template <>
+void GfxRenderer::drawPixelDither<Color::White>(const int x, const int y) const {
+  drawPixel(x, y, false);
+}
+
+template <>
+void GfxRenderer::drawPixelDither<Color::LightGray>(const int x, const int y) const {
+  drawPixel(x, y, x % 2 == 0 && y % 2 == 0);
+}
+
+template <>
+void GfxRenderer::drawPixelDither<Color::DarkGray>(const int x, const int y) const {
+  drawPixel(x, y, (x + y) % 2 == 0);  // TODO: maybe find a better pattern?
+}
+
+void GfxRenderer::fillRectDither(const int x, const int y, const int width, const int height, Color color) const {
+  if (color == Color::Clear) {
+  } else if (color == Color::Black) {
+    fillRect(x, y, width, height, true);
+  } else if (color == Color::White) {
+    fillRect(x, y, width, height, false);
+  } else if (color == Color::LightGray) {
+    for (int fillY = y; fillY < y + height; fillY++) {
+      for (int fillX = x; fillX < x + width; fillX++) {
+        drawPixelDither<Color::LightGray>(fillX, fillY);
+      }
+    }
+  } else if (color == Color::DarkGray) {
+    for (int fillY = y; fillY < y + height; fillY++) {
+      for (int fillX = x; fillX < x + width; fillX++) {
+        drawPixelDither<Color::DarkGray>(fillX, fillY);
+      }
+    }
+  }
+}
+
+template <Color color>
+void GfxRenderer::fillArc(const int maxRadius, const int cx, const int cy, const int xDir, const int yDir) const {
+  const int radiusSq = maxRadius * maxRadius;
+  for (int dy = 0; dy <= maxRadius; ++dy) {
+    for (int dx = 0; dx <= maxRadius; ++dx) {
+      const int distSq = dx * dx + dy * dy;
+      const int px = cx + xDir * dx;
+      const int py = cy + yDir * dy;
+      if (distSq <= radiusSq) {
+        drawPixelDither<color>(px, py);
+      }
+    }
+  }
+}
+
+void GfxRenderer::fillRoundedRect(const int x, const int y, const int width, const int height, const int cornerRadius,
+                                  const Color color) const {
+  fillRoundedRect(x, y, width, height, cornerRadius, true, true, true, true, color);
+}
+
+void GfxRenderer::fillRoundedRect(const int x, const int y, const int width, const int height, const int cornerRadius,
+                                  bool roundTopLeft, bool roundTopRight, bool roundBottomLeft, bool roundBottomRight,
+                                  const Color color) const {
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+
+  // Assume if we're not rounding all corners then we are only rounding one side
+  const int roundedSides = (!roundTopLeft || !roundTopRight || !roundBottomLeft || !roundBottomRight) ? 1 : 2;
+  const int maxRadius = std::min({cornerRadius, width / roundedSides, height / roundedSides});
+  if (maxRadius <= 0) {
+    fillRectDither(x, y, width, height, color);
+    return;
+  }
+
+  const int horizontalWidth = width - 2 * maxRadius;
+  if (horizontalWidth > 0) {
+    fillRectDither(x + maxRadius + 1, y, horizontalWidth - 2, height, color);
+  }
+
+  const int leftFillTop = y + (roundTopLeft ? (maxRadius + 1) : 0);
+  const int leftFillBottom = y + height - 1 - (roundBottomLeft ? (maxRadius + 1) : 0);
+  if (leftFillBottom >= leftFillTop) {
+    fillRectDither(x, leftFillTop, maxRadius + 1, leftFillBottom - leftFillTop + 1, color);
+  }
+
+  const int rightFillTop = y + (roundTopRight ? (maxRadius + 1) : 0);
+  const int rightFillBottom = y + height - 1 - (roundBottomRight ? (maxRadius + 1) : 0);
+  if (rightFillBottom >= rightFillTop) {
+    fillRectDither(x + width - maxRadius - 1, rightFillTop, maxRadius + 1, rightFillBottom - rightFillTop + 1, color);
+  }
+
+  auto fillArcTemplated = [this](int maxRadius, int cx, int cy, int xDir, int yDir, Color color) {
+    switch (color) {
+      case Color::Clear:
+        break;
+      case Color::Black:
+        fillArc<Color::Black>(maxRadius, cx, cy, xDir, yDir);
+        break;
+      case Color::White:
+        fillArc<Color::White>(maxRadius, cx, cy, xDir, yDir);
+        break;
+      case Color::LightGray:
+        fillArc<Color::LightGray>(maxRadius, cx, cy, xDir, yDir);
+        break;
+      case Color::DarkGray:
+        fillArc<Color::DarkGray>(maxRadius, cx, cy, xDir, yDir);
+        break;
+    }
+  };
+
+  if (roundTopLeft) {
+    fillArcTemplated(maxRadius, x + maxRadius, y + maxRadius, -1, -1, color);
+  }
+
+  if (roundTopRight) {
+    fillArcTemplated(maxRadius, x + width - maxRadius - 1, y + maxRadius, 1, -1, color);
+  }
+
+  if (roundBottomRight) {
+    fillArcTemplated(maxRadius, x + width - maxRadius - 1, y + height - maxRadius - 1, 1, 1, color);
+  }
+
+  if (roundBottomLeft) {
+    fillArcTemplated(maxRadius, x + maxRadius, y + height - maxRadius - 1, -1, 1, color);
+  }
+}
+
+void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, const int width, const int height) const {
+  int rotatedX = 0;
+  int rotatedY = 0;
+  rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY);
+  // Rotate origin corner
+  switch (orientation) {
+    case Portrait:
+      rotatedY = rotatedY - height;
+      break;
+    case PortraitInverted:
+      rotatedX = rotatedX - width;
+      break;
+    case LandscapeClockwise:
+      rotatedY = rotatedY - height;
+      rotatedX = rotatedX - width;
+      break;
+    case LandscapeCounterClockwise:
+      break;
+  }
+  // TODO: Rotate bits
+  display.drawImage(bitmap, rotatedX, rotatedY, width, height);
+}
+
+void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, const int width, const int height) const {
+  display.drawImageTransparent(bitmap, y, getScreenWidth() - width - x, height, width);
+}
+
+void GfxRenderer::drawIconInverted(const uint8_t bitmap[], const int x, const int y, const int width,
+                                   const int height) const {
+  // Draw icon as white pixels on dark background (set bits where icon has cleared bits).
+  // Same coordinate transform as drawIcon: phyX = logY, phyY = screenW - width - logX
+  const uint16_t phyX = static_cast<uint16_t>(y);
+  const uint16_t phyY = static_cast<uint16_t>(getScreenWidth() - width - x);
+  const uint16_t w = static_cast<uint16_t>(height);  // physical width = logical height
+  const uint16_t h = static_cast<uint16_t>(width);   // physical height = logical width
+  const uint16_t imageWidthBytes = w / 8;
+
+  for (uint16_t row = 0; row < h; row++) {
+    const uint16_t destY = phyY + row;
+    if (destY >= HalDisplay::DISPLAY_HEIGHT) break;
+    const uint16_t destOffset = destY * HalDisplay::DISPLAY_WIDTH_BYTES + (phyX / 8);
+    const uint16_t srcOffset = row * imageWidthBytes;
+    for (uint16_t col = 0; col < imageWidthBytes; col++) {
+      if ((phyX / 8 + col) >= HalDisplay::DISPLAY_WIDTH_BYTES) break;
+      uint8_t srcByte = bitmap[srcOffset + col];
+      // Original: frameBuffer &= srcByte (black where icon is 0)
+      // Inverted: frameBuffer |= ~srcByte (white where icon is 0)
+      frameBuffer[destOffset + col] |= ~srcByte;
+    }
+  }
+}
+
+void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, const int maxWidth, const int maxHeight,
+                             const float cropX, const float cropY, const bool allowUpscale) const {
+  if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
+  // For 1-bit bitmaps, use optimized 1-bit rendering path (no crop support for 1-bit)
+  if (bitmap.is1Bit() && cropX == 0.0f && cropY == 0.0f) {
+    drawBitmap1Bit(bitmap, x, y, maxWidth, maxHeight, allowUpscale);
+    return;
+  }
+
+  float scale = 1.0f;
+  bool isScaled = false;
+  int cropPixX = std::floor(bitmap.getWidth() * cropX / 2.0f);
+  int cropPixY = std::floor(bitmap.getHeight() * cropY / 2.0f);
+  LOG_DBG("GFX", "Cropping %dx%d by %dx%d pix, is %s", bitmap.getWidth(), bitmap.getHeight(), cropPixX, cropPixY,
+          bitmap.isTopDown() ? "top-down" : "bottom-up");
+
+  const float croppedWidth = (1.0f - cropX) * bitmap.getWidth();
+  const float croppedHeight = (1.0f - cropY) * bitmap.getHeight();
+
+  if (maxWidth > 0 && croppedWidth > 0.0f) {
+    const float widthScale = static_cast<float>(maxWidth) / croppedWidth;
+    if (allowUpscale || widthScale < 1.0f) {
+      scale = widthScale;
+      isScaled = widthScale != 1.0f;
+    }
+  }
+  if (maxHeight > 0 && croppedHeight > 0.0f) {
+    const float heightScale = static_cast<float>(maxHeight) / croppedHeight;
+    if (allowUpscale || heightScale < 1.0f) {
+      scale = isScaled ? std::min(scale, heightScale) : heightScale;
+      isScaled = heightScale != 1.0f || isScaled;
+    }
+  }
+  LOG_DBG("GFX", "Scaling by %f - %s", scale, isScaled ? "scaled" : "not scaled");
+  const bool isUpscaled = scale > 1.0f;
+
+  // Calculate output row size (2 bits per pixel, packed into bytes)
+  // IMPORTANT: Use int, not uint8_t, to avoid overflow for images > 1020 pixels wide
+  const int outputRowSize = (bitmap.getWidth() + 3) / 4;
+  auto* outputRow = static_cast<uint8_t*>(malloc(outputRowSize));
+  auto* rowBytes = static_cast<uint8_t*>(malloc(bitmap.getRowBytes()));
+
+  if (!outputRow || !rowBytes) {
+    LOG_ERR("GFX", "!! Failed to allocate BMP row buffers");
+    free(outputRow);
+    free(rowBytes);
+    return;
+  }
+
+  for (int bmpY = 0; bmpY < (bitmap.getHeight() - cropPixY); bmpY++) {
+    // The BMP's (0, 0) is the bottom-left corner (if the height is positive, top-left if negative).
+    // Screen's (0, 0) is the top-left corner.
+    const int sourceY = -cropPixY + (bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY);
+    int screenY = sourceY;
+    if (isScaled) {
+      screenY = std::floor(screenY * scale);
+    }
+    screenY += y;  // the offset should not be scaled
+    int screenYEnd = screenY;
+    if (isUpscaled) {
+      screenYEnd = y + static_cast<int>(std::floor((sourceY + 1) * scale)) - 1;
+      screenYEnd = std::max(screenYEnd, screenY);
+    }
+
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      LOG_ERR("GFX", "Failed to read row %d from bitmap", bmpY);
+      free(outputRow);
+      free(rowBytes);
+      return;
+    }
+
+    if (screenYEnd < 0 || screenY >= getScreenHeight()) {
+      continue;
+    }
+
+    if (bmpY < cropPixY) {
+      // Skip the row if it's outside the crop area
+      continue;
+    }
+
+    const int drawYStart = std::max(0, screenY);
+    const int drawYEnd = std::min(getScreenHeight() - 1, screenYEnd);
+
+    for (int bmpX = cropPixX; bmpX < bitmap.getWidth() - cropPixX; bmpX++) {
+      const int sourceX = bmpX - cropPixX;
+      int screenX = sourceX;
+      if (isScaled) {
+        screenX = std::floor(screenX * scale);
+      }
+      screenX += x;  // the offset should not be scaled
+      int screenXEnd = screenX;
+      if (isUpscaled) {
+        screenXEnd = x + static_cast<int>(std::floor((sourceX + 1) * scale)) - 1;
+        screenXEnd = std::max(screenXEnd, screenX);
+      }
+      if (screenX >= getScreenWidth()) {
+        break;
+      }
+      if (screenXEnd < 0) {
+        continue;
+      }
+      const int drawXStart = std::max(0, screenX);
+      const int drawXEnd = std::min(getScreenWidth() - 1, screenXEnd);
+
+      const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
+
+      for (int py = drawYStart; py <= drawYEnd; py++) {
+        for (int px = drawXStart; px <= drawXEnd; px++) {
+          if (renderMode == BW && val < 3) {
+            drawPixel(px, py);
+          } else if (renderMode == GRAYSCALE_MSB && (val == 1 || val == 2)) {
+            drawPixel(px, py, false);
+          } else if (renderMode == GRAYSCALE_LSB && val == 1) {
+            drawPixel(px, py, false);
+          }
+        }
+      }
+    }
+  }
+
+  free(outputRow);
+  free(rowBytes);
+}
+
+void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y, const int maxWidth,
+                                 const int maxHeight, const bool allowUpscale) const {
+  float scale = 1.0f;
+  bool isScaled = false;
+  if (maxWidth > 0 && bitmap.getWidth() > 0) {
+    const float widthScale = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
+    if (allowUpscale || widthScale < 1.0f) {
+      scale = widthScale;
+      isScaled = widthScale != 1.0f;
+    }
+  }
+  if (maxHeight > 0 && bitmap.getHeight() > 0) {
+    const float heightScale = static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight());
+    if (allowUpscale || heightScale < 1.0f) {
+      scale = isScaled ? std::min(scale, heightScale) : heightScale;
+      isScaled = heightScale != 1.0f || isScaled;
+    }
+  }
+  const bool isUpscaled = scale > 1.0f;
+
+  // For 1-bit BMP, output is still 2-bit packed (for consistency with readNextRow)
+  const int outputRowSize = (bitmap.getWidth() + 3) / 4;
+  auto* outputRow = static_cast<uint8_t*>(malloc(outputRowSize));
+  auto* rowBytes = static_cast<uint8_t*>(malloc(bitmap.getRowBytes()));
+
+  if (!outputRow || !rowBytes) {
+    LOG_ERR("GFX", "!! Failed to allocate 1-bit BMP row buffers");
+    free(outputRow);
+    free(rowBytes);
+    return;
+  }
+
+  for (int bmpY = 0; bmpY < bitmap.getHeight(); bmpY++) {
+    // Read rows sequentially using readNextRow
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      LOG_ERR("GFX", "Failed to read row %d from 1-bit bitmap", bmpY);
+      free(outputRow);
+      free(rowBytes);
+      return;
+    }
+
+    // Calculate screen Y based on whether BMP is top-down or bottom-up
+    const int bmpYOffset = bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY;
+    int screenY = y + (isScaled ? static_cast<int>(std::floor(bmpYOffset * scale)) : bmpYOffset);
+    int screenYEnd = screenY;
+    if (isUpscaled) {
+      screenYEnd = y + static_cast<int>(std::floor((bmpYOffset + 1) * scale)) - 1;
+      screenYEnd = std::max(screenYEnd, screenY);
+    }
+    if (screenYEnd < 0 || screenY >= getScreenHeight()) {
+      continue;
+    }
+    const int drawYStart = std::max(0, screenY);
+    const int drawYEnd = std::min(getScreenHeight() - 1, screenYEnd);
+
+    for (int bmpX = 0; bmpX < bitmap.getWidth(); bmpX++) {
+      int screenX = x + (isScaled ? static_cast<int>(std::floor(bmpX * scale)) : bmpX);
+      int screenXEnd = screenX;
+      if (isUpscaled) {
+        screenXEnd = x + static_cast<int>(std::floor((bmpX + 1) * scale)) - 1;
+        screenXEnd = std::max(screenXEnd, screenX);
+      }
+      if (screenX >= getScreenWidth()) {
+        break;
+      }
+      if (screenXEnd < 0) {
+        continue;
+      }
+      const int drawXStart = std::max(0, screenX);
+      const int drawXEnd = std::min(getScreenWidth() - 1, screenXEnd);
+
+      // Get 2-bit value (result of readNextRow quantization)
+      const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
+
+      // For 1-bit source: 0 or 1 -> map to black (0,1,2) or white (3)
+      // val < 3 means black pixel (draw it)
+      if (val < 3) {
+        for (int py = drawYStart; py <= drawYEnd; py++) {
+          for (int px = drawXStart; px <= drawXEnd; px++) {
+            drawPixel(px, py, true);
+          }
+        }
+      }
+      // White pixels (val == 3) are not drawn (leave background)
+    }
+  }
+
+  free(outputRow);
+  free(rowBytes);
+}
+
+void GfxRenderer::fillPolygon(const int* xPoints, const int* yPoints, int numPoints, bool state) const {
+  if (numPoints < 3) return;
+
+  // Find bounding box
+  int minY = yPoints[0], maxY = yPoints[0];
+  for (int i = 1; i < numPoints; i++) {
+    if (yPoints[i] < minY) minY = yPoints[i];
+    if (yPoints[i] > maxY) maxY = yPoints[i];
+  }
+
+  // Clip to screen
+  if (minY < 0) minY = 0;
+  if (maxY >= getScreenHeight()) maxY = getScreenHeight() - 1;
+
+  // Allocate node buffer for scanline algorithm
+  auto* nodeX = static_cast<int*>(malloc(numPoints * sizeof(int)));
+  if (!nodeX) {
+    LOG_ERR("GFX", "!! Failed to allocate polygon node buffer");
+    return;
+  }
+
+  // Scanline fill algorithm
+  for (int scanY = minY; scanY <= maxY; scanY++) {
+    int nodes = 0;
+
+    // Find all intersection points with edges
+    int j = numPoints - 1;
+    for (int i = 0; i < numPoints; i++) {
+      if ((yPoints[i] < scanY && yPoints[j] >= scanY) || (yPoints[j] < scanY && yPoints[i] >= scanY)) {
+        // Calculate X intersection using fixed-point to avoid float
+        int dy = yPoints[j] - yPoints[i];
+        if (dy != 0) {
+          nodeX[nodes++] = xPoints[i] + (scanY - yPoints[i]) * (xPoints[j] - xPoints[i]) / dy;
+        }
+      }
+      j = i;
+    }
+
+    // Sort nodes by X (simple bubble sort, numPoints is small)
+    for (int i = 0; i < nodes - 1; i++) {
+      for (int k = i + 1; k < nodes; k++) {
+        if (nodeX[i] > nodeX[k]) {
+          int temp = nodeX[i];
+          nodeX[i] = nodeX[k];
+          nodeX[k] = temp;
+        }
+      }
+    }
+
+    // Fill between pairs of nodes
+    for (int i = 0; i < nodes - 1; i += 2) {
+      int startX = nodeX[i];
+      int endX = nodeX[i + 1];
+
+      // Clip to screen
+      if (startX < 0) startX = 0;
+      if (endX >= getScreenWidth()) endX = getScreenWidth() - 1;
+
+      // Draw horizontal line
+      for (int x = startX; x <= endX; x++) {
+        drawPixel(x, scanY, state);
+      }
+    }
+  }
+
+  free(nodeX);
+}
+
+// For performance measurement (using static to allow "const" methods)
+static unsigned long start_ms = 0;
+
+void GfxRenderer::clearScreen(const uint8_t color) const {
+  start_ms = millis();
+  display.clearScreen(color);
+}
+
+void GfxRenderer::invertScreen() const {
+  for (int i = 0; i < HalDisplay::BUFFER_SIZE; i++) {
+    frameBuffer[i] = ~frameBuffer[i];
+  }
+}
+
+void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode) const {
+  auto elapsed = millis() - start_ms;
+  LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
+  HalDisplay::RefreshMode effectiveMode = refreshMode;
+  if (hasNextRefreshOverride_) {
+    // Take whichever mode is STRONGER (lower enum value in FULL/HALF/FAST).
+    // A caller that explicitly passes FULL_REFRESH — e.g. BootActivity's
+    // wake-path ghost-clear pass — must never be silently downgraded to
+    // the transition override's HALF_REFRESH. Conversely, activities that
+    // use the default FAST_REFRESH get upgraded to HALF so the previous
+    // activity's content is fully cleared.
+    if (static_cast<int>(nextRefreshOverride_) < static_cast<int>(effectiveMode)) {
+      effectiveMode = nextRefreshOverride_;
+    }
+    hasNextRefreshOverride_ = false;
+  }
+  display.displayBuffer(effectiveMode, fadingFix);
+}
+
+std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
+                                       const EpdFontFamily::Style style) const {
+  if (!text || maxWidth <= 0) return "";
+
+  std::string item = text;
+  // U+2026 HORIZONTAL ELLIPSIS (UTF-8: 0xE2 0x80 0xA6)
+  const char* ellipsis = "\xe2\x80\xa6";
+  int textWidth = getTextWidth(fontId, item.c_str(), style);
+  if (textWidth <= maxWidth) {
+    // Text fits, return as is
+    return item;
+  }
+
+  while (!item.empty() && getTextWidth(fontId, (item + ellipsis).c_str(), style) >= maxWidth) {
+    utf8RemoveLastChar(item);
+  }
+
+  return item.empty() ? ellipsis : item + ellipsis;
+}
+
+std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* text, const int maxWidth,
+                                                  const int maxLines, const EpdFontFamily::Style style) const {
+  std::vector<std::string> lines;
+
+  if (!text || maxWidth <= 0 || maxLines <= 0) return lines;
+
+  std::string remaining = text;
+  std::string currentLine;
+
+  while (!remaining.empty()) {
+    if (static_cast<int>(lines.size()) == maxLines - 1) {
+      // Last available line: combine any word already started on this line with
+      // the rest of the text, then let truncatedText fit it with an ellipsis.
+      std::string lastContent = currentLine.empty() ? remaining : currentLine + " " + remaining;
+      lines.push_back(truncatedText(fontId, lastContent.c_str(), maxWidth, style));
+      return lines;
+    }
+
+    // Find next word
+    size_t spacePos = remaining.find(' ');
+    std::string word;
+
+    if (spacePos == std::string::npos) {
+      word = remaining;
+      remaining.clear();
+    } else {
+      word = remaining.substr(0, spacePos);
+      remaining.erase(0, spacePos + 1);
+    }
+
+    std::string testLine = currentLine.empty() ? word : currentLine + " " + word;
+
+    if (getTextWidth(fontId, testLine.c_str(), style) <= maxWidth) {
+      currentLine = testLine;
+    } else {
+      if (!currentLine.empty()) {
+        lines.push_back(currentLine);
+        // If the carried-over word itself exceeds maxWidth, truncate it and
+        // push it as a complete line immediately — storing it in currentLine
+        // would allow a subsequent short word to be appended after the ellipsis.
+        if (getTextWidth(fontId, word.c_str(), style) > maxWidth) {
+          lines.push_back(truncatedText(fontId, word.c_str(), maxWidth, style));
+          currentLine.clear();
+          if (static_cast<int>(lines.size()) >= maxLines) return lines;
+        } else {
+          currentLine = word;
+        }
+      } else {
+        // Single word wider than maxWidth: truncate and stop to avoid complicated
+        // splitting rules (different between languages). Results in an aesthetically
+        // pleasing end.
+        lines.push_back(truncatedText(fontId, word.c_str(), maxWidth, style));
+        return lines;
+      }
+    }
+  }
+
+  if (!currentLine.empty() && static_cast<int>(lines.size()) < maxLines) {
+    lines.push_back(currentLine);
+  }
+
+  return lines;
+}
+
+// Note: Internal driver treats screen in command orientation; this library exposes a logical orientation
+int GfxRenderer::getScreenWidth() const {
+  switch (orientation) {
+    case Portrait:
+    case PortraitInverted:
+      return HalDisplay::LOGICAL_PORTRAIT_WIDTH;
+    case LandscapeClockwise:
+    case LandscapeCounterClockwise:
+      return HalDisplay::LOGICAL_PORTRAIT_HEIGHT;
+  }
+  return HalDisplay::LOGICAL_PORTRAIT_WIDTH;
+}
+
+int GfxRenderer::getScreenHeight() const {
+  switch (orientation) {
+    case Portrait:
+    case PortraitInverted:
+      return HalDisplay::LOGICAL_PORTRAIT_HEIGHT;
+    case LandscapeClockwise:
+    case LandscapeCounterClockwise:
+      return HalDisplay::LOGICAL_PORTRAIT_WIDTH;
+  }
+  return HalDisplay::LOGICAL_PORTRAIT_HEIGHT;
+}
+
+int GfxRenderer::getSpaceWidth(const int fontId, const EpdFontFamily::Style style) const {
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+
+  const EpdGlyph* spaceGlyph = fontIt->second.getGlyph(' ', style);
+  return spaceGlyph ? fp4::toPixel(spaceGlyph->advanceX) : 0;  // snap 12.4 fixed-point to nearest pixel
+}
+
+int GfxRenderer::getSpaceAdvance(const int fontId, const uint32_t leftCp, const uint32_t rightCp,
+                                 const EpdFontFamily::Style style) const {
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) return 0;
+  const auto& font = fontIt->second;
+  const EpdGlyph* spaceGlyph = font.getGlyph(' ', style);
+  const int32_t spaceAdvanceFP = spaceGlyph ? static_cast<int32_t>(spaceGlyph->advanceX) : 0;
+  // Combine space advance + flanking kern into one fixed-point sum before snapping.
+  // Snapping the combined value avoids the +/-1 px error from snapping each component separately.
+  const int32_t kernFP = static_cast<int32_t>(font.getKerning(leftCp, ' ', style)) +
+                         static_cast<int32_t>(font.getKerning(' ', rightCp, style));
+  return fp4::toPixel(spaceAdvanceFP + kernFP);
+}
+
+int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint32_t rightCp,
+                            const EpdFontFamily::Style style) const {
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) return 0;
+  const int kernFP = fontIt->second.getKerning(leftCp, rightCp, style);  // 4.4 fixed-point
+  return fp4::toPixel(kernFP);                                           // snap 4.4 fixed-point to nearest pixel
+}
+
+int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFamily::Style style) const {
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+
+  uint32_t cp;
+  uint32_t prevCp = 0;
+  int32_t widthFP = 0;  // 12.4 fixed-point accumulator
+  const auto& font = fontIt->second;
+  const EpdFontFamily* fallbackFont = resolveFallbackFont(*this, fontId, font);
+  const EpdFontFamily* secondaryFallbackFont = getSecondaryFallbackFont(fontId);
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
+    if (utf8IsCombiningMark(cp)) {
+      continue;
+    }
+    cp = font.applyLigatures(cp, text, style);
+    if (prevCp != 0) {
+      widthFP += font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
+    }
+    const EpdGlyph* glyph = font.hasNativeGlyph(cp, style) ? font.getGlyph(cp, style) : nullptr;
+    if (!glyph && fallbackFont) {
+      glyph = fallbackFont->getGlyph(cp, style);
+    }
+    if (!glyph && secondaryFallbackFont) {
+      glyph = secondaryFallbackFont->getGlyph(cp, style);
+    }
+    if (!glyph) {
+      glyph = font.getGlyph(cp, style);  // Fall back to replacement glyph
+    }
+    if (glyph) widthFP += glyph->advanceX;  // 12.4 fixed-point advance
+    prevCp = cp;
+  }
+  return fp4::toPixel(widthFP);  // snap 12.4 fixed-point to nearest pixel
+}
+
+int GfxRenderer::getTextFitWidth(const int fontId, const char* text, EpdFontFamily::Style style) const {
+  if (text == nullptr || *text == '\0') {
+    return 0;
+  }
+
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+
+  const auto& font = fontIt->second;
+  const EpdFontFamily* fallbackFont = resolveFallbackFont(*this, fontId, font);
+  const EpdFontFamily* secondaryFallbackFont = getSecondaryFallbackFont(fontId);
+  int32_t cursorXFP = 0;  // 12.4 fixed-point accumulator
+  int lastBaseX = 0;
+  int lastBaseAdvanceFP = 0;
+  int maxRight = 0;
+  uint32_t prevCp = 0;
+  uint32_t cp;
+
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
+    const bool isCombining = utf8IsCombiningMark(cp);
+    if (!isCombining) {
+      cp = font.applyLigatures(cp, text, style);
+      if (prevCp != 0) {
+        cursorXFP += font.getKerning(prevCp, cp, style);
+      }
+    }
+
+    const EpdGlyph* glyph = font.hasNativeGlyph(cp, style) ? font.getGlyph(cp, style) : nullptr;
+    if (!glyph && fallbackFont) {
+      glyph = fallbackFont->getGlyph(cp, style);
+    }
+    if (!glyph && secondaryFallbackFont) {
+      glyph = secondaryFallbackFont->getGlyph(cp, style);
+    }
+    if (!glyph) {
+      glyph = font.getGlyph(cp, style);  // Fall back to replacement glyph
+    }
+    if (!glyph) {
+      if (!isCombining) {
+        prevCp = cp;
+      }
+      continue;
+    }
+
+    const int glyphBaseX = isCombining ? getCombiningAnchorX(cursorXFP, lastBaseX, lastBaseAdvanceFP, cp)
+                                       : fp4::toPixel(cursorXFP);
+    maxRight = std::max(maxRight, glyphBaseX + glyph->left + glyph->width);
+
+    if (!isCombining) {
+      lastBaseX = glyphBaseX;
+      lastBaseAdvanceFP = glyph->advanceX;
+      cursorXFP += glyph->advanceX;
+      prevCp = cp;
+    }
+  }
+
+  return std::max(fp4::toPixel(cursorXFP), maxRight);
+}
+
+int GfxRenderer::getFontAscenderSize(const int fontId) const {
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+
+  return fontIt->second.getData(EpdFontFamily::REGULAR)->ascender;
+}
+
+int GfxRenderer::getLineHeight(const int fontId) const {
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+
+  return fontIt->second.getData(EpdFontFamily::REGULAR)->advanceY;
+}
+
+int GfxRenderer::getTextHeight(const int fontId) const {
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+  return fontIt->second.getData(EpdFontFamily::REGULAR)->ascender;
+}
+
+void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y, const char* text, const bool black,
+                                      const EpdFontFamily::Style style) const {
+  // Cannot draw a NULL / empty string
+  if (text == nullptr || *text == '\0') {
+    return;
+  }
+
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return;
+  }
+
+  const auto& font = fontIt->second;
+  const EpdFontFamily* fallbackFont = resolveFallbackFont(*this, fontId, font);
+  const EpdFontFamily* secondaryFallbackFont = getSecondaryFallbackFont(fontId);
+
+  int32_t yPosFP = fp4::fromPixel(y);  // 12.4 fixed-point accumulator
+  int lastBaseY = y;
+  int lastBaseAdvanceFP = 0;  // 12.4 fixed-point
+  int lastBaseTop = 0;
+  constexpr int MIN_COMBINING_GAP_PX = 1;
+
+  uint32_t cp;
+  uint32_t prevCp = 0;
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
+    if (utf8IsCombiningMark(cp)) {
+      const EpdGlyph* combiningGlyph = font.getGlyph(cp, style);
+      if (!combiningGlyph && fallbackFont) {
+        combiningGlyph = fallbackFont->getGlyph(cp, style);
+      }
+      if (!combiningGlyph && secondaryFallbackFont) {
+        combiningGlyph = secondaryFallbackFont->getGlyph(cp, style);
+      }
+      int raiseBy = 0;
+      if (combiningGlyph) {
+        const int currentGap = combiningGlyph->top - combiningGlyph->height - lastBaseTop;
+        if (currentGap < MIN_COMBINING_GAP_PX) {
+          raiseBy = MIN_COMBINING_GAP_PX - currentGap;
+        }
+      }
+
+      const int combiningX = x - raiseBy;
+      const int combiningY = getCombiningAnchorYRotated(yPosFP, lastBaseY, lastBaseAdvanceFP, cp);
+      renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, fallbackFont, secondaryFallbackFont, cp,
+                                                combiningX, combiningY, black, style);
+      continue;
+    }
+
+    cp = font.applyLigatures(cp, text, style);
+    if (prevCp != 0) {
+      yPosFP -= font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern (subtract for rotated)
+    }
+
+    lastBaseY = fp4::toPixel(yPosFP);  // snap 12.4 fixed-point to nearest pixel
+    const EpdGlyph* glyph = font.hasNativeGlyph(cp, style) ? font.getGlyph(cp, style) : nullptr;
+    if (!glyph && fallbackFont) {
+      glyph = fallbackFont->getGlyph(cp, style);
+    }
+    if (!glyph && secondaryFallbackFont) {
+      glyph = secondaryFallbackFont->getGlyph(cp, style);
+    }
+    if (!glyph) {
+      glyph = font.getGlyph(cp, style);  // Fall back to replacement glyph
+    }
+
+    lastBaseAdvanceFP = glyph ? glyph->advanceX : 0;  // 12.4 fixed-point
+    lastBaseTop = glyph ? glyph->top : 0;
+
+    renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, fallbackFont, secondaryFallbackFont, cp, x,
+                                              lastBaseY, black, style);
+    if (glyph) {
+      yPosFP -= glyph->advanceX;  // 12.4 fixed-point advance (subtract for rotated)
+    }
+    prevCp = cp;
+  }
+}
+
+uint8_t* GfxRenderer::getFrameBuffer() const { return frameBuffer; }
+
+size_t GfxRenderer::getBufferSize() { return HalDisplay::BUFFER_SIZE; }
+
+// unused
+// void GfxRenderer::grayscaleRevert() const { display.grayscaleRevert(); }
+
+void GfxRenderer::copyGrayscaleLsbBuffers() const { display.copyGrayscaleLsbBuffers(frameBuffer); }
+
+void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuffers(frameBuffer); }
+
+void GfxRenderer::displayGrayBuffer() const { display.displayGrayBuffer(fadingFix); }
+
+void GfxRenderer::freeBwBufferChunks() {
+  for (auto& bwBufferChunk : bwBufferChunks) {
+    if (bwBufferChunk) {
+      free(bwBufferChunk);
+      bwBufferChunk = nullptr;
+    }
+  }
+}
+
+/**
+ * This should be called before grayscale buffers are populated.
+ * A `restoreBwBuffer` call should always follow the grayscale render if this method was called.
+ * Uses chunked allocation to avoid needing 48KB of contiguous memory.
+ * Returns true if buffer was stored successfully, false if allocation failed.
+ */
+bool GfxRenderer::storeBwBuffer() {
+  // Allocate and copy each chunk
+  for (size_t i = 0; i < BW_BUFFER_NUM_CHUNKS; i++) {
+    // Check if any chunks are already allocated
+    if (bwBufferChunks[i]) {
+      LOG_ERR("GFX", "!! BW buffer chunk %zu already stored - this is likely a bug, freeing chunk", i);
+      free(bwBufferChunks[i]);
+      bwBufferChunks[i] = nullptr;
+    }
+
+    const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
+    const size_t chunkSize = getBwBufferChunkSize(i);
+    bwBufferChunks[i] = static_cast<uint8_t*>(malloc(chunkSize));
+
+    if (!bwBufferChunks[i]) {
+      LOG_ERR("GFX", "!! Failed to allocate BW buffer chunk %zu (%zu bytes)", i, chunkSize);
+      // Free previously allocated chunks
+      freeBwBufferChunks();
+      return false;
+    }
+
+    memcpy(bwBufferChunks[i], frameBuffer + offset, chunkSize);
+  }
+
+  LOG_DBG("GFX", "Stored BW buffer in %zu chunks", BW_BUFFER_NUM_CHUNKS);
+  return true;
+}
+
+/**
+ * This can only be called if `storeBwBuffer` was called prior to the grayscale render.
+ * It should be called to restore the BW buffer state after grayscale rendering is complete.
+ * Uses chunked restoration to match chunked storage.
+ */
+void GfxRenderer::restoreBwBuffer() {
+  // Check if all chunks are allocated
+  bool missingChunks = false;
+  for (const auto& bwBufferChunk : bwBufferChunks) {
+    if (!bwBufferChunk) {
+      missingChunks = true;
+      break;
+    }
+  }
+
+  if (missingChunks) {
+    freeBwBufferChunks();
+    return;
+  }
+
+  for (size_t i = 0; i < BW_BUFFER_NUM_CHUNKS; i++) {
+    const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
+    const size_t chunkSize = getBwBufferChunkSize(i);
+    memcpy(frameBuffer + offset, bwBufferChunks[i], chunkSize);
+  }
+
+  display.cleanupGrayscaleBuffers(frameBuffer);
+
+  freeBwBufferChunks();
+  LOG_DBG("GFX", "Restored and freed BW buffer chunks");
+}
+
+/**
+ * Cleanup grayscale buffers using the current frame buffer.
+ * Use this when BW buffer was re-rendered instead of stored/restored.
+ */
+void GfxRenderer::cleanupGrayscaleWithFrameBuffer() const {
+  if (frameBuffer) {
+    display.cleanupGrayscaleBuffers(frameBuffer);
+  }
+}
+
+void GfxRenderer::getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const {
+  switch (orientation) {
+    case Portrait:
+      *outTop = VIEWABLE_MARGIN_TOP;
+      *outRight = VIEWABLE_MARGIN_RIGHT;
+      *outBottom = VIEWABLE_MARGIN_BOTTOM;
+      *outLeft = VIEWABLE_MARGIN_LEFT;
+      break;
+    case LandscapeClockwise:
+      *outTop = VIEWABLE_MARGIN_LEFT;
+      *outRight = VIEWABLE_MARGIN_TOP;
+      *outBottom = VIEWABLE_MARGIN_RIGHT;
+      *outLeft = VIEWABLE_MARGIN_BOTTOM;
+      break;
+    case PortraitInverted:
+      *outTop = VIEWABLE_MARGIN_BOTTOM;
+      *outRight = VIEWABLE_MARGIN_LEFT;
+      *outBottom = VIEWABLE_MARGIN_TOP;
+      *outLeft = VIEWABLE_MARGIN_RIGHT;
+      break;
+    case LandscapeCounterClockwise:
+      *outTop = VIEWABLE_MARGIN_RIGHT;
+      *outRight = VIEWABLE_MARGIN_BOTTOM;
+      *outBottom = VIEWABLE_MARGIN_LEFT;
+      *outLeft = VIEWABLE_MARGIN_TOP;
+      break;
+  }
+}

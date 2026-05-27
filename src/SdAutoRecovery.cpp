@@ -1,0 +1,282 @@
+#include "SdAutoRecovery.h"
+
+#include <Arduino.h>
+#include <HalStorage.h>
+#include <Logging.h>
+
+#include <cstring>
+#include <string>
+
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+
+#include "bootloader_common.h"
+#include "esp_flash_partitions.h"
+
+#include "network/PokiInkFwMagic.h"
+
+namespace SdAutoRecovery {
+namespace {
+
+constexpr size_t MIN_FW_SIZE = 256 * 1024;       // 256 KB sanity floor
+constexpr size_t MAX_FW_SIZE = 6 * 1024 * 1024;  // 6 MB — fits app partition
+constexpr size_t WRITE_CHUNK = 4096;             // 1 flash sector
+
+bool renameWithSuffix(const char* path, const char* suffix) {
+  // Build "<path><suffix>".  If a stale version exists from a previous run,
+  // remove it first — Storage.rename refuses to overwrite.  Storage.remove
+  // tolerates non-existent paths.
+  std::string target = std::string(path) + suffix;
+  Storage.remove(target.c_str());
+  return Storage.rename(path, target.c_str());
+}
+
+// Pre-flight header check on the SD FILE (not the flash partition) so we can
+// bail without erasing anything if the file is obviously wrong.
+bool checkFileHeader(FsFile& file, const char* path) {
+  uint8_t header[48];
+  if (!file.seek(0) || file.read(header, sizeof(header)) != static_cast<int>(sizeof(header))) {
+    LOG_ERR("RECOV", "Header read failed for %s", path);
+    renameWithSuffix(path, ".rejected.readerr");
+    return false;
+  }
+  if (header[0] != 0xE9) {
+    LOG_ERR("RECOV", "Bad image magic: 0x%02X (expected 0xE9)", header[0]);
+    renameWithSuffix(path, ".rejected.notesp32");
+    return false;
+  }
+  uint32_t appMagic = 0;
+  std::memcpy(&appMagic, header + 32, sizeof(appMagic));
+  if (appMagic != 0xABCD5432u) {
+    LOG_ERR("RECOV", "Bad app_desc magic: 0x%08lX (expected 0xABCD5432)",
+            static_cast<unsigned long>(appMagic));
+    renameWithSuffix(path, ".rejected.noappdesc");
+    return false;
+  }
+  return true;
+}
+
+// Verify the just-flashed partition carries our board's magic marker.
+// Mirrors what the network OTA installer does (OtaUpdater.cpp).  Rejecting
+// here means we DON'T flip otadata — the bricked / wrong-board firmware
+// stays in the inactive slot but never boots.
+bool verifyPokiInkMagic(const esp_partition_t* part) {
+  constexpr size_t SCAN_SIZE = 256 * 1024;
+  const void* mapped = nullptr;
+  esp_partition_mmap_handle_t handle = 0;
+  esp_err_t err = esp_partition_mmap(part, 0, SCAN_SIZE, ESP_PARTITION_MMAP_DATA, &mapped, &handle);
+  if (err != ESP_OK || mapped == nullptr) {
+    LOG_ERR("RECOV", "mmap failed for board-tag scan: %s", esp_err_to_name(err));
+    return false;
+  }
+  const uint8_t* haystack = static_cast<const uint8_t*>(mapped);
+  const uint8_t needle0 = static_cast<uint8_t>(POKIINK_X3_FW_MAGIC[0]);
+  bool found = false;
+  // Manual first-byte filter + memcmp.  Avoids depending on memmem (not
+  // always present in ESP-IDF's libc) and is fast enough — 256 KB scans in
+  // well under a second on the C3's 160 MHz CPU.
+  for (size_t i = 0; i + POKIINK_X3_FW_MAGIC_LEN <= SCAN_SIZE; ++i) {
+    if (haystack[i] != needle0) continue;
+    if (std::memcmp(haystack + i, POKIINK_X3_FW_MAGIC,
+                    static_cast<size_t>(POKIINK_X3_FW_MAGIC_LEN)) == 0) {
+      found = true;
+      break;
+    }
+  }
+  esp_partition_munmap(handle);
+  return found;
+}
+
+// Update otadata to point at `target`.  Same routine the network OTA
+// installer uses — keeps wear leveling (writes to the lower-seq sector),
+// allocates a seq number that maps to the right slot, and uses
+// ESP_OTA_IMG_UNDEFINED state so main.cpp's first-boot-after-flash detector
+// can switch it to VALID on next boot.
+bool flipOtadataTo(const esp_partition_t* target) {
+  const esp_partition_t* otadata =
+      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr);
+  if (!otadata) {
+    LOG_ERR("RECOV", "otadata partition not found");
+    return false;
+  }
+
+  esp_ota_select_entry_t entry[2];
+  esp_partition_read(otadata, 0, &entry[0], sizeof(entry[0]));
+  esp_partition_read(otadata, 0x1000, &entry[1], sizeof(entry[1]));
+  const bool valid0 = bootloader_common_ota_select_valid(&entry[0]);
+  const bool valid1 = bootloader_common_ota_select_valid(&entry[1]);
+
+  uint32_t maxSeq = 0;
+  if (valid0) maxSeq = entry[0].ota_seq;
+  if (valid1 && entry[1].ota_seq > maxSeq) maxSeq = entry[1].ota_seq;
+
+  const int targetSlot = target->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0;
+  uint32_t newSeq = maxSeq + 1;
+  // (seq - 1) % num_partitions must equal slot index — bump if it doesn't.
+  if ((newSeq - 1) % 2 != static_cast<uint32_t>(targetSlot)) {
+    newSeq++;
+  }
+
+  esp_ota_select_entry_t newEntry;
+  std::memset(&newEntry, 0xFF, sizeof(newEntry));
+  newEntry.ota_seq = newSeq;
+  newEntry.ota_state = ESP_OTA_IMG_UNDEFINED;
+  newEntry.crc = bootloader_common_ota_select_crc(&newEntry);
+
+  // Pick the staler sector to write into (wear leveling).
+  int writeSector;
+  if (!valid0) {
+    writeSector = 0;
+  } else if (!valid1) {
+    writeSector = 1;
+  } else {
+    writeSector = (entry[0].ota_seq <= entry[1].ota_seq) ? 0 : 1;
+  }
+  const uint32_t writeOffset = static_cast<uint32_t>(writeSector) * 0x1000;
+
+  esp_err_t err = esp_partition_erase_range(otadata, writeOffset, 0x1000);
+  if (err != ESP_OK) {
+    LOG_ERR("RECOV", "otadata erase failed: %s", esp_err_to_name(err));
+    return false;
+  }
+  err = esp_partition_write(otadata, writeOffset, &newEntry, sizeof(newEntry));
+  if (err != ESP_OK) {
+    LOG_ERR("RECOV", "otadata write failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  LOG_INF("RECOV", "otadata updated → slot %d (ota_seq=%lu, sector=%d)", targetSlot,
+          static_cast<unsigned long>(newSeq), writeSector);
+  return true;
+}
+
+bool verifyAndFlash(const char* path) {
+  FsFile file;
+  if (!Storage.openFileForRead("RECOV", path, file)) {
+    LOG_ERR("RECOV", "Open failed for %s", path);
+    return false;
+  }
+
+  const size_t fileSize = file.size();
+  if (fileSize < MIN_FW_SIZE || fileSize > MAX_FW_SIZE) {
+    LOG_ERR("RECOV", "Size out of range: %u bytes (limits %u..%u)", static_cast<unsigned>(fileSize),
+            static_cast<unsigned>(MIN_FW_SIZE), static_cast<unsigned>(MAX_FW_SIZE));
+    file.close();
+    renameWithSuffix(path, ".rejected.size");
+    return false;
+  }
+
+  if (!checkFileHeader(file, path)) {
+    file.close();
+    return false;
+  }
+
+  const esp_partition_t* target = esp_ota_get_next_update_partition(nullptr);
+  if (!target) {
+    LOG_ERR("RECOV", "No inactive OTA partition found");
+    file.close();
+    renameWithSuffix(path, ".rejected.nopartition");
+    return false;
+  }
+  if (fileSize > target->size) {
+    LOG_ERR("RECOV", "File (%u) larger than partition (%u)", static_cast<unsigned>(fileSize),
+            static_cast<unsigned>(target->size));
+    file.close();
+    renameWithSuffix(path, ".rejected.toolarge");
+    return false;
+  }
+
+  LOG_INF("RECOV", "Erasing target partition '%s' (offset 0x%lX, size %u)", target->label,
+          static_cast<unsigned long>(target->address), static_cast<unsigned>(target->size));
+  esp_err_t err = esp_partition_erase_range(target, 0, target->size);
+  if (err != ESP_OK) {
+    LOG_ERR("RECOV", "Erase failed: %s", esp_err_to_name(err));
+    file.close();
+    renameWithSuffix(path, ".rejected.eraseerr");
+    return false;
+  }
+
+  if (!file.seek(0)) {
+    LOG_ERR("RECOV", "Seek to 0 failed");
+    file.close();
+    renameWithSuffix(path, ".rejected.seekerr");
+    return false;
+  }
+
+  uint8_t buf[WRITE_CHUNK];
+  size_t written = 0;
+  const unsigned long tStart = millis();
+  while (written < fileSize) {
+    const size_t want = (fileSize - written) > WRITE_CHUNK ? WRITE_CHUNK : (fileSize - written);
+    const int n = file.read(buf, want);
+    if (n != static_cast<int>(want)) {
+      LOG_ERR("RECOV", "Short read at offset %u: got %d, wanted %u", static_cast<unsigned>(written), n,
+              static_cast<unsigned>(want));
+      file.close();
+      renameWithSuffix(path, ".rejected.shortread");
+      return false;
+    }
+    err = esp_partition_write(target, written, buf, want);
+    if (err != ESP_OK) {
+      LOG_ERR("RECOV", "Write failed at offset %u: %s", static_cast<unsigned>(written), esp_err_to_name(err));
+      file.close();
+      renameWithSuffix(path, ".rejected.writeerr");
+      return false;
+    }
+    written += want;
+    if ((written & 0x3FFFF) == 0) {  // every 256 KB
+      LOG_INF("RECOV", "  %u / %u KB", static_cast<unsigned>(written / 1024),
+              static_cast<unsigned>(fileSize / 1024));
+    }
+  }
+  file.close();
+  const unsigned long writeMs = millis() - tStart;
+  LOG_INF("RECOV", "Wrote %u bytes in %lu ms (%lu KB/s)", static_cast<unsigned>(fileSize), writeMs,
+          static_cast<unsigned long>(fileSize / (writeMs ? writeMs : 1)));
+
+  if (!verifyPokiInkMagic(target)) {
+    LOG_ERR("RECOV", "POKIINK_X3_FW_MAGIC not found — refusing to switch boot target. "
+                    "File is likely for a different board (e.g. X4) or not a PokiInk-X3 build. "
+                    "Bootloader will keep loading the current slot.");
+    renameWithSuffix(path, ".rejected.wrongboard");
+    return false;
+  }
+  LOG_INF("RECOV", "PokiInk-X3 board tag verified on flashed partition.");
+
+  if (!flipOtadataTo(target)) {
+    renameWithSuffix(path, ".rejected.otadata_write");
+    return false;
+  }
+
+  // Rename the source file so we don't re-flash on every boot.
+  renameWithSuffix(path, ".applied");
+  return true;
+}
+
+}  // namespace
+
+void runIfRequested() {
+  // Probe in priority order — first hit wins, others are ignored this boot.
+  static const char* const kCandidates[] = {
+      "/pokiink-recovery.bin",
+      "/pokiink-update.bin",
+      "/update.bin",
+  };
+  for (const char* path : kCandidates) {
+    if (!Storage.exists(path)) continue;
+    LOG_INF("RECOV", "SD auto-recovery: found %s — attempting install", path);
+    if (verifyAndFlash(path)) {
+      LOG_INF("RECOV", "SD auto-recovery SUCCESS — rebooting in 2 seconds");
+      delay(2000);
+      ESP.restart();
+      // unreachable
+    }
+    LOG_ERR("RECOV", "SD auto-recovery FAILED for %s — see .rejected.* suffix on SD for the reason", path);
+    // Don't try the next candidate after a failure.  If the user dropped a
+    // bad file we'd just overwrite the inactive partition with another bad
+    // copy.  Better to surface the rejection clearly and let them retry.
+    return;
+  }
+}
+
+}  // namespace SdAutoRecovery
