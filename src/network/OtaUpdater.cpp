@@ -9,6 +9,7 @@
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_task_wdt.h"
 #include "esp_wifi.h"
 
 #include "bootloader_common.h"
@@ -283,12 +284,41 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(void (*onProgress)(void*),
     return INTERNAL_UPDATE_ERROR;
   }
 
+  // Download + flash loop.  esp_https_ota_perform() does one chunk per call;
+  // we keep going until it returns something other than IN_PROGRESS.
+  //
+  // Reliability gotchas this loop has to handle, learned the hard way:
+  //
+  //  1. Task watchdog.  arduino-esp32 enables a 5-second TWDT on the loopTask
+  //     by default.  esp_https_ota_perform() is a synchronous network +
+  //     flash write call — on slow WiFi (~1-2 Mbps, common on shared 2.4 GHz
+  //     in flats) a single chunk can take well over 5 s, especially for
+  //     the TLS handshake and the first few chunks.  Without an
+  //     esp_task_wdt_reset() per iteration the chip silently hard-resets
+  //     mid-download — symptom is "user walks away, comes back to find the
+  //     device rebooted into the OLD firmware" because otadata never got
+  //     flipped before the watchdog fired.
+  //
+  //  2. Iteration delay.  The previous delay(100) added 100 ms of sleep
+  //     between every ~8 KB chunk, capping throughput at ~80 KB/s even on
+  //     fast networks.  A 6 MB firmware then takes 75+ seconds minimum
+  //     just from the sleeps.  Dropped to 10 ms — still yields to other
+  //     tasks (UI / WiFi housekeeping) but doesn't artificially throttle
+  //     the download.
+  //
+  //  3. Progress reporting.  onProgress() drives the e-ink redraw, which
+  //     takes ~400 ms each (FAST_REFRESH).  Calling it every iteration
+  //     would re-render dozens of times per second.  The activity's
+  //     render() already filters to every 2% change (see
+  //     OtaUpdateActivity::render), so we let it decide when to actually
+  //     redraw — we just signal that there's new data via `render = true`.
   do {
     esp_err = esp_https_ota_perform(ota_handle);
     processedSize = esp_https_ota_get_image_len_read(ota_handle);
     render = true;
     if (onProgress) onProgress(progressCtx);
-    delay(100);
+    esp_task_wdt_reset();
+    delay(10);
   } while (esp_err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
 
   /* Return back to default power saving for WiFi in case of failing */

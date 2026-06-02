@@ -9,6 +9,7 @@
 
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_task_wdt.h"
 
 #include "bootloader_common.h"
 #include "esp_flash_partitions.h"
@@ -224,6 +225,13 @@ bool verifyAndFlash(const char* path) {
       return false;
     }
     written += want;
+    // Feed the task watchdog.  Writing 6 MB at the X3's SD speed takes
+    // 30-60 s end-to-end; without this the 5-second TWDT would reset the
+    // chip mid-flash and the otadata flip below would never run, leaving
+    // the user on the old slot — the same "OTA looked successful then
+    // device rebooted to old version" symptom we hit on the network OTA
+    // path.  Same pattern as OtaUpdater.cpp's download loop.
+    esp_task_wdt_reset();
     if ((written & 0x3FFFF) == 0) {  // every 256 KB
       LOG_INF("RECOV", "  %u / %u KB", static_cast<unsigned>(written / 1024),
               static_cast<unsigned>(fileSize / 1024));
