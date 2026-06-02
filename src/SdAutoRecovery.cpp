@@ -274,6 +274,17 @@ const char* findCandidate() {
 
 }  // namespace
 
+bool flashFromFile(const char* path) {
+  // Public wrapper around the private verifyAndFlash helper.  Same machinery,
+  // exposed so the Settings → System → Update from SD activity can call it
+  // with any user-picked .bin file (not just the auto-discovery filenames).
+  // The auto-recovery flow renames the source file to .applied on success so
+  // it doesn't trigger again next boot — we DON'T rename here because the
+  // user explicitly picked this file through a menu and may want to flash
+  // sibling devices from the same SD card.
+  return verifyAndFlash(path);
+}
+
 void runIfRequested(bool forceRecoveryMode) {
   if (forceRecoveryMode) {
     // ─── Forced recovery mode ─────────────────────────────────────────────

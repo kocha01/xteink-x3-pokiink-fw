@@ -57,6 +57,22 @@
 
 namespace SdAutoRecovery {
 
+// Verify a single file on the SD card and flash it to the inactive OTA
+// partition.  Returns true on success (caller should reboot), false on any
+// rejection (the source file gets renamed with a .rejected.<reason> suffix
+// so the user can diagnose).  Used by:
+//   * runIfRequested() below — the auto-discovery flow
+//   * SdFirmwareUpdateActivity — the Settings → System → Update from SD
+//     menu, which lets the user pick any .bin file by name rather than
+//     relying on the hardcoded filename list
+//
+// `path` is an absolute path on the SD root (e.g. "/myfirmware.bin").
+// Same verification gates as the auto-recovery flow: ESP32 image magic,
+// app_desc magic, size bounds, POKIINK_X3_FW_MAGIC marker.  Does NOT
+// rename the file on success; the caller is expected to reboot, after
+// which the SD file is harmless (otadata already points at the new slot).
+bool flashFromFile(const char* path);
+
 // Scan SD root for a recovery file, verify, flash to inactive OTA partition,
 // flip otadata, reboot.  Returns immediately if no candidate file is found.
 //

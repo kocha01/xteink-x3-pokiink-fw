@@ -24,6 +24,7 @@ enum class SettingAction {
   ClearRecentBooks,
   CheckForUpdates,
   SwitchFirmwareSlot,
+  SdFirmwareUpdate,
   Language,
   SelectWallpaper,
   SelectSdFont,
