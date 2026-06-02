@@ -515,7 +515,41 @@ void setup() {
   // potentially broken previous firmware gets a chance to run.  Full filename
   // list, safety gates, and rejection suffixes are documented in
   // src/SdAutoRecovery.h.
-  SdAutoRecovery::runIfRequested();
+  //
+  // UP+POWER at boot replicates the Xteink OEM bootloader's manual recovery
+  // gesture — users who flashed PokiInk via Unlocker (or whose flow lost
+  // the Xteink bootloader) lose that hardware recovery path, so we
+  // re-implement it at the app firmware level here.  Holding the combo
+  // forces SdAutoRecovery into a blocking-wait mode that polls SD for 60 s
+  // (rather than the silent one-shot check used on every boot), letting the
+  // user insert the card AFTER pressing the buttons just like they would
+  // on stock firmware.  We also init the display so the user gets visual
+  // confirmation that recovery mode is active — without it, holding the
+  // combo looks identical to a normal boot until the SD flash finishes,
+  // and a user who misjudged the button timing would have no way to tell.
+  gpio.update();
+  const bool forceRecovery =
+      gpio.isPressed(HalGPIO::BTN_UP) && gpio.isPressed(HalGPIO::BTN_POWER);
+  if (forceRecovery) {
+    LOG_INF("MAIN", "UP+POWER held at boot — entering forced recovery mode");
+    setupDisplayAndFonts();
+    activityManager.goToFullScreenMessage(
+        "Recovery Mode\n\nInsert SD card with\nupdate.bin at the root.\n\nWaiting up to 60 s...",
+        EpdFontFamily::BOLD);
+  }
+  SdAutoRecovery::runIfRequested(forceRecovery);
+  if (forceRecovery) {
+    // If we got here, SdAutoRecovery returned without rebooting — either
+    // the 60 s deadline elapsed with no valid file, or every found file
+    // failed verification.  Show a clear message and reboot rather than
+    // fall through to normal boot, because the user explicitly asked for
+    // recovery and silently dropping back would be confusing.
+    activityManager.goToFullScreenMessage(
+        "Recovery timeout\n\nNo valid update.bin found on SD.\n\nRestarting...",
+        EpdFontFamily::BOLD);
+    delay(3000);
+    ESP.restart();
+  }
 
   SETTINGS.loadFromFile();
 

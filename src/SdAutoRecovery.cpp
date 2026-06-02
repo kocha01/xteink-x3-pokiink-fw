@@ -255,15 +255,79 @@ bool verifyAndFlash(const char* path) {
 
 }  // namespace
 
-void runIfRequested() {
-  // Probe in priority order — first hit wins, others are ignored this boot.
-  static const char* const kCandidates[] = {
-      "/pokiink-recovery.bin",
-      "/pokiink-update.bin",
-      "/update.bin",
-  };
+namespace {
+
+// Probe in priority order — first hit wins, others are ignored this boot.
+constexpr const char* kCandidates[] = {
+    "/pokiink-recovery.bin",
+    "/pokiink-update.bin",
+    "/update.bin",
+};
+
+// Returns the path to the first candidate file that exists on SD, or nullptr.
+const char* findCandidate() {
   for (const char* path : kCandidates) {
-    if (!Storage.exists(path)) continue;
+    if (Storage.exists(path)) return path;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+void runIfRequested(bool forceRecoveryMode) {
+  if (forceRecoveryMode) {
+    // ─── Forced recovery mode ─────────────────────────────────────────────
+    // Triggered by main.cpp when the user holds UP+POWER at boot — the
+    // Xteink OEM bootloader's "insert SD with update.bin" workflow that
+    // PokiInk users expect to inherit.  Unlike the silent auto-check, this
+    // mode BLOCKS waiting for the user to insert an SD card (or for an
+    // already-present file to be detected by the SD layer).
+    //
+    // 60-second deadline keeps a stuck-button scenario from soft-locking
+    // boot — if the deadline expires we fall back to normal boot, where the
+    // user's currently installed firmware will run (and presumably let them
+    // navigate to Settings → System Update or otherwise try again).
+    constexpr unsigned long RECOVERY_TIMEOUT_MS = 60000;
+    constexpr unsigned long POLL_INTERVAL_MS    = 500;
+    const unsigned long deadline = millis() + RECOVERY_TIMEOUT_MS;
+    LOG_INF("RECOV", "Forced recovery mode — polling SD for /update.bin (or /pokiink-update.bin "
+                     "/ /pokiink-recovery.bin) every %lu ms for up to %lu s",
+            POLL_INTERVAL_MS, RECOVERY_TIMEOUT_MS / 1000);
+
+    unsigned long lastHeartbeatLog = 0;
+    while (millis() < deadline) {
+      if (const char* path = findCandidate()) {
+        LOG_INF("RECOV", "Forced recovery: found %s — verifying", path);
+        if (verifyAndFlash(path)) {
+          LOG_INF("RECOV", "Forced recovery SUCCESS — rebooting in 2 seconds");
+          delay(2000);
+          ESP.restart();
+          // unreachable
+        }
+        LOG_ERR("RECOV", "Forced recovery FAILED for %s — see .rejected.* suffix. "
+                          "Continuing to wait in case user drops a corrected file.",
+                path);
+        // Don't return — let the user fix the file and try again within the
+        // 60 s window.  verifyAndFlash already renamed the rejected file so
+        // findCandidate() won't re-trigger on the same path.
+      }
+      // Periodic heartbeat (every 5 s) so Serial monitor users know we're alive.
+      const unsigned long now = millis();
+      if (now - lastHeartbeatLog >= 5000) {
+        LOG_INF("RECOV", "  ...waiting (%lu s remaining)",
+                (deadline - now) / 1000);
+        lastHeartbeatLog = now;
+      }
+      delay(POLL_INTERVAL_MS);
+    }
+    LOG_INF("RECOV", "Forced recovery timeout — continuing normal boot");
+    return;
+  }
+
+  // ─── Silent auto-recovery (default) ─────────────────────────────────────
+  // One-shot check.  If a candidate file is present we attempt flash; if
+  // not, we return immediately so the running firmware can boot normally.
+  if (const char* path = findCandidate()) {
     LOG_INF("RECOV", "SD auto-recovery: found %s — attempting install", path);
     if (verifyAndFlash(path)) {
       LOG_INF("RECOV", "SD auto-recovery SUCCESS — rebooting in 2 seconds");
@@ -275,7 +339,6 @@ void runIfRequested() {
     // Don't try the next candidate after a failure.  If the user dropped a
     // bad file we'd just overwrite the inactive partition with another bad
     // copy.  Better to surface the rejection clearly and let them retry.
-    return;
   }
 }
 

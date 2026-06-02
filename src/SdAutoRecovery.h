@@ -60,9 +60,22 @@ namespace SdAutoRecovery {
 // Scan SD root for a recovery file, verify, flash to inactive OTA partition,
 // flip otadata, reboot.  Returns immediately if no candidate file is found.
 //
+// Two operating modes:
+//   * normal (forceRecoveryMode=false, default): scans the SD root ONCE for
+//     a known recovery filename.  Returns immediately if none is present so
+//     that boot can continue to the running firmware.  Designed for the
+//     "previous firmware crashed, drop file on SD, power-cycle" workflow
+//     where the file is in place before the device powers on.
+//   * forced recovery (forceRecoveryMode=true): BLOCKS for up to 60 seconds
+//     polling the SD root every 500 ms.  Use this when the user explicitly
+//     asks for recovery (e.g. holds UP+POWER at boot — the Xteink OEM
+//     bootloader behaviour PokiInk users expect to inherit) and may not
+//     have inserted the SD card yet.  Returns once a valid file is found
+//     and flashed (then reboots), or after the 60-second deadline expires.
+//
 // Side effects on success: reboots the device (does not return).
 // Side effects on failure: renames the candidate file with a .rejected.*
 // suffix and returns normally so boot can continue.
-void runIfRequested();
+void runIfRequested(bool forceRecoveryMode = false);
 
 }  // namespace SdAutoRecovery
