@@ -97,7 +97,27 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
       gpio_hold_en(sdPowerPin);
       gpio_deep_sleep_hold_en();
     }
-    pinMode(BoardConfig::Pins::kPowerButton, INPUT);
+    // Use INPUT_PULLUP, not bare INPUT, for the wake pin.
+    //
+    // The POWER button is wired GPIO3 → GND through the switch.  With INPUT
+    // (high-Z), the pin's idle state depends entirely on the external
+    // pull-up resistor on the X3 PCB.  On units installed via Unlocker
+    // WiFi MITM, the Xteink OEM bootloader stays in place and leaves the
+    // pin's RTC-domain pull-up DISABLED when it hands off to our app —
+    // different from the arduino-esp32 stage-2 bootloader (USB-flashed
+    // case) which leaves the default RTC pull-up enabled.  Without the
+    // RTC pull-up, leakage / coupling from adjacent pins occasionally
+    // drags GPIO3 LOW for a few microseconds during deep sleep, which the
+    // GPIO wakeup logic latches as a "button press" → device wakes by
+    // itself even though the user touched nothing.
+    //
+    // gpio_set_pull_mode() reaches the RTC pull-up control directly, so
+    // it survives deep sleep regardless of what the bootloader left
+    // configured.  Belt-and-suspenders: keep pinMode(INPUT_PULLUP) for
+    // the digital-domain config in case any other init clobbers it.
+    pinMode(BoardConfig::Pins::kPowerButton, INPUT_PULLUP);
+    gpio_set_pull_mode(static_cast<gpio_num_t>(BoardConfig::Pins::kPowerButton),
+                       GPIO_PULLUP_ONLY);
   }
 
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);

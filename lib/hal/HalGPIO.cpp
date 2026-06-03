@@ -1,4 +1,5 @@
 #include <HalGPIO.h>
+#include <Logging.h>
 #include <SPI.h>
 #include <esp_ota_ops.h>
 
@@ -48,6 +49,13 @@ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
   const bool usbConnected = isUsbConnected();
   const auto wakeupCause = esp_sleep_get_wakeup_cause();
   const auto resetReason = esp_reset_reason();
+  // Diagnostic log: surfaces the actual hardware wake source so users
+  // experiencing spontaneous wakes can capture it from Serial Monitor and
+  // we don't have to guess.  EXT0/EXT1/GPIO/TIMER/TOUCH/ULP cover the
+  // entire ESP32-C3 sleep wakeup space.
+  LOG_DBG("GPIO",
+          "Wakeup diagnostic: wakeupCause=%d resetReason=%d usbConnected=%d",
+          static_cast<int>(wakeupCause), static_cast<int>(resetReason), usbConnected ? 1 : 0);
 
   // First-boot-after-flash detection takes precedence over every reset-reason
   // heuristic below: a fresh OTA write leaves otadata in state=NEW (the
