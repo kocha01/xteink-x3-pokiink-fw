@@ -50,12 +50,17 @@
 class SdFirmwareUpdateActivity final : public Activity {
  public:
   enum class State {
-    LIST,           // Showing file list, waiting for selection
-    CONFIRM,        // User picked a file; showing "Flash this? Y/N"
-    FLASHING,       // verifyAndFlash in progress
-    REBOOTING,      // Success — about to ESP.restart()
-    FAILED,         // verify or flash failed; showing reason
-    EMPTY,          // No .bin files on SD; instructions screen
+    LIST,             // Showing file list, waiting for selection
+    CONFIRM,          // User picked a file; showing "Flash this? Y/N"
+    FLASHING,         // verifyAndFlash in progress
+    REBOOTING,        // Success — about to ESP.restart()
+    FAILED,           // verify or flash failed for a reason that isn't
+                      // wrong-board (size, header, hardware) — terminal
+    WRONG_BOARD,      // File flashed cleanly but missing PokiInk magic.
+                      // Offer "Force install" with a clear brick warning.
+    FLASHING_FORCED,  // User confirmed Force install; verifyAndFlash
+                      // running again with skipBoardCheck=true
+    EMPTY,            // No .bin files on SD; instructions screen
   };
 
   struct FileInfo {
@@ -72,7 +77,7 @@ class SdFirmwareUpdateActivity final : public Activity {
 
   void loadFileList();
   void enterConfirm();
-  void performFlash();
+  void performFlash(bool skipBoardCheck);
 
  public:
   explicit SdFirmwareUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)

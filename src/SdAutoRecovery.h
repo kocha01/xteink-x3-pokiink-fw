@@ -57,21 +57,63 @@
 
 namespace SdAutoRecovery {
 
+// Outcome of a flash attempt.  We expose the failure category (not just a
+// bool) so the Settings-menu UI can react specifically to WRONG_BOARD —
+// that's the one rejection a knowledgeable user might legitimately want
+// to override (e.g. installing CrossInk for X3 on a PokiInk-X3 device, or
+// downgrading to stock Xteink), and we offer a "Force install" path for
+// it.  Every other failure is a real problem (bad file, hardware error,
+// truncated download) where bypassing the check would just waste another
+// flash cycle.
+enum class FlashResult {
+  SUCCESS,            // Boot target switched; caller should reboot.
+  OPEN_FAIL,          // SD file couldn't be opened (missing / SD glitch).
+  SIZE_OUT_OF_RANGE,  // File too small (< 256 KB) or too big (> 6 MB).
+  BAD_HEADER,         // ESP32 image magic / app_desc magic mismatch.
+  PARTITION_ERROR,    // Couldn't find or erase the inactive OTA partition.
+  WRITE_FAIL,         // esp_partition_write returned an error mid-stream.
+  WRONG_BOARD,        // POKIINK_X3_FW_MAGIC not found in flashed partition.
+                      // Caller may retry with skipBoardCheck=true if the
+                      // user accepts the brick risk.
+  OTADATA_FAIL,       // Flash succeeded but otadata couldn't be flipped.
+};
+
 // Verify a single file on the SD card and flash it to the inactive OTA
-// partition.  Returns true on success (caller should reboot), false on any
-// rejection (the source file gets renamed with a .rejected.<reason> suffix
-// so the user can diagnose).  Used by:
+// partition.  Returns FlashResult::SUCCESS on success (caller should
+// reboot); any other value means the source file got renamed with a
+// .rejected.<reason> suffix so the user can diagnose on a PC.  Used by:
 //   * runIfRequested() below — the auto-discovery flow
 //   * SdFirmwareUpdateActivity — the Settings → System → Update from SD
 //     menu, which lets the user pick any .bin file by name rather than
 //     relying on the hardcoded filename list
 //
 // `path` is an absolute path on the SD root (e.g. "/myfirmware.bin").
-// Same verification gates as the auto-recovery flow: ESP32 image magic,
-// app_desc magic, size bounds, POKIINK_X3_FW_MAGIC marker.  Does NOT
-// rename the file on success; the caller is expected to reboot, after
-// which the SD file is harmless (otadata already points at the new slot).
-bool flashFromFile(const char* path);
+// Verification gates: size, ESP32 image magic, app_desc magic, and
+// POKIINK_X3_FW_MAGIC marker (the board-tag check).
+//
+// `skipBoardCheck=true` SKIPS the POKIINK_X3_FW_MAGIC verification.  The
+// other gates still run.  Intended for explicit user opt-in from the
+// Settings menu's "Force install" prompt after the safe path already
+// flagged the file as wrong-board.  USING THIS ON AN X4 BINARY WILL BRICK
+// AN X3 DEVICE — it bypasses the only line of defense we have against
+// blind board-mismatch installs, so callers must surface a clear warning
+// to the user first.
+FlashResult flashFromFile(const char* path, bool skipBoardCheck = false);
+
+// Quick pre-flight: read the first 256 KB of a file on SD and check for the
+// POKIINK_X3_FW_MAGIC marker.  Returns true if the marker is present
+// (file is a PokiInk-X3 build) or false otherwise.  Takes ~250 ms on a
+// typical SD card.
+//
+// Used by SdFirmwareUpdateActivity to decide BEFORE the multi-second flash
+// whether to immediately route to the "Force install" warning.  Without
+// this pre-check the user would have to wait through a full flash + verify
+// cycle (~30-60 s) only to discover the file is wrong-board.
+//
+// Returns false on any I/O error too — that means the file is also bad
+// for flashing, so the caller can treat both cases the same way (don't
+// auto-flash, show some kind of warning).
+bool hasMagicInFile(const char* path);
 
 // Scan SD root for a recovery file, verify, flash to inactive OTA partition,
 // flip otadata, reboot.  Returns immediately if no candidate file is found.

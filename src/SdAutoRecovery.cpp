@@ -151,11 +151,11 @@ bool flipOtadataTo(const esp_partition_t* target) {
   return true;
 }
 
-bool verifyAndFlash(const char* path) {
+FlashResult verifyAndFlash(const char* path, bool skipBoardCheck = false) {
   FsFile file;
   if (!Storage.openFileForRead("RECOV", path, file)) {
     LOG_ERR("RECOV", "Open failed for %s", path);
-    return false;
+    return FlashResult::OPEN_FAIL;
   }
 
   const size_t fileSize = file.size();
@@ -164,12 +164,12 @@ bool verifyAndFlash(const char* path) {
             static_cast<unsigned>(MIN_FW_SIZE), static_cast<unsigned>(MAX_FW_SIZE));
     file.close();
     renameWithSuffix(path, ".rejected.size");
-    return false;
+    return FlashResult::SIZE_OUT_OF_RANGE;
   }
 
   if (!checkFileHeader(file, path)) {
     file.close();
-    return false;
+    return FlashResult::BAD_HEADER;
   }
 
   const esp_partition_t* target = esp_ota_get_next_update_partition(nullptr);
@@ -177,14 +177,14 @@ bool verifyAndFlash(const char* path) {
     LOG_ERR("RECOV", "No inactive OTA partition found");
     file.close();
     renameWithSuffix(path, ".rejected.nopartition");
-    return false;
+    return FlashResult::PARTITION_ERROR;
   }
   if (fileSize > target->size) {
     LOG_ERR("RECOV", "File (%u) larger than partition (%u)", static_cast<unsigned>(fileSize),
             static_cast<unsigned>(target->size));
     file.close();
     renameWithSuffix(path, ".rejected.toolarge");
-    return false;
+    return FlashResult::SIZE_OUT_OF_RANGE;
   }
 
   LOG_INF("RECOV", "Erasing target partition '%s' (offset 0x%lX, size %u)", target->label,
@@ -194,14 +194,14 @@ bool verifyAndFlash(const char* path) {
     LOG_ERR("RECOV", "Erase failed: %s", esp_err_to_name(err));
     file.close();
     renameWithSuffix(path, ".rejected.eraseerr");
-    return false;
+    return FlashResult::PARTITION_ERROR;
   }
 
   if (!file.seek(0)) {
     LOG_ERR("RECOV", "Seek to 0 failed");
     file.close();
     renameWithSuffix(path, ".rejected.seekerr");
-    return false;
+    return FlashResult::WRITE_FAIL;
   }
 
   uint8_t buf[WRITE_CHUNK];
@@ -215,14 +215,14 @@ bool verifyAndFlash(const char* path) {
               static_cast<unsigned>(want));
       file.close();
       renameWithSuffix(path, ".rejected.shortread");
-      return false;
+      return FlashResult::WRITE_FAIL;
     }
     err = esp_partition_write(target, written, buf, want);
     if (err != ESP_OK) {
       LOG_ERR("RECOV", "Write failed at offset %u: %s", static_cast<unsigned>(written), esp_err_to_name(err));
       file.close();
       renameWithSuffix(path, ".rejected.writeerr");
-      return false;
+      return FlashResult::WRITE_FAIL;
     }
     written += want;
     // Feed the task watchdog.  Writing 6 MB at the X3's SD speed takes
@@ -242,23 +242,29 @@ bool verifyAndFlash(const char* path) {
   LOG_INF("RECOV", "Wrote %u bytes in %lu ms (%lu KB/s)", static_cast<unsigned>(fileSize), writeMs,
           static_cast<unsigned long>(fileSize / (writeMs ? writeMs : 1)));
 
-  if (!verifyPokiInkMagic(target)) {
-    LOG_ERR("RECOV", "POKIINK_X3_FW_MAGIC not found — refusing to switch boot target. "
-                    "File is likely for a different board (e.g. X4) or not a PokiInk-X3 build. "
-                    "Bootloader will keep loading the current slot.");
-    renameWithSuffix(path, ".rejected.wrongboard");
-    return false;
+  if (!skipBoardCheck) {
+    if (!verifyPokiInkMagic(target)) {
+      LOG_ERR("RECOV", "POKIINK_X3_FW_MAGIC not found — refusing to switch boot target. "
+                      "File is likely for a different board (e.g. X4) or not a PokiInk-X3 build. "
+                      "Bootloader will keep loading the current slot.");
+      renameWithSuffix(path, ".rejected.wrongboard");
+      return FlashResult::WRONG_BOARD;
+    }
+    LOG_INF("RECOV", "PokiInk-X3 board tag verified on flashed partition.");
+  } else {
+    LOG_INF("RECOV", "skipBoardCheck=true — POKIINK_X3_FW_MAGIC verification skipped at caller's "
+                    "explicit request.  If the binary is for a different board (e.g. X4), the "
+                    "device will brick on next boot.  Hope you know what you're doing.");
   }
-  LOG_INF("RECOV", "PokiInk-X3 board tag verified on flashed partition.");
 
   if (!flipOtadataTo(target)) {
     renameWithSuffix(path, ".rejected.otadata_write");
-    return false;
+    return FlashResult::OTADATA_FAIL;
   }
 
   // Rename the source file so we don't re-flash on every boot.
   renameWithSuffix(path, ".applied");
-  return true;
+  return FlashResult::SUCCESS;
 }
 
 }  // namespace
@@ -282,15 +288,71 @@ const char* findCandidate() {
 
 }  // namespace
 
-bool flashFromFile(const char* path) {
+bool hasMagicInFile(const char* path) {
+  // Read first 256 KB of the file in chunks and scan for POKIINK_X3_FW_MAGIC.
+  // Same scan range as verifyPokiInkMagic() uses on the flashed partition —
+  // staying consistent means a pre-scan PASS guarantees the post-flash
+  // verify will also PASS (modulo cosmic-ray-flips-during-write).
+  FsFile file;
+  if (!Storage.openFileForRead("RECOV", path, file)) {
+    LOG_ERR("RECOV", "Magic pre-scan: open failed for %s", path);
+    return false;
+  }
+  if (!file.seek(0)) {
+    file.close();
+    return false;
+  }
+
+  constexpr size_t SCAN_SIZE = 256 * 1024;
+  constexpr size_t CHUNK = 4096;
+  // 24-byte overlap between chunks so we don't miss a magic that straddles
+  // a chunk boundary.  Carry the trailing bytes of the previous chunk into
+  // the head of the next.
+  constexpr size_t OVERLAP = static_cast<size_t>(POKIINK_X3_FW_MAGIC_LEN) - 1;
+  static_assert(OVERLAP < CHUNK, "overlap must be smaller than chunk size");
+
+  uint8_t buf[CHUNK + OVERLAP];
+  std::memset(buf, 0, sizeof(buf));
+  size_t carry = 0;       // bytes carried over from the previous chunk
+  size_t scanned = 0;
+  bool found = false;
+  const uint8_t needle0 = static_cast<uint8_t>(POKIINK_X3_FW_MAGIC[0]);
+
+  while (scanned < SCAN_SIZE) {
+    const size_t want = std::min(CHUNK, SCAN_SIZE - scanned);
+    const int n = file.read(buf + carry, want);
+    if (n <= 0) break;
+    const size_t total = carry + static_cast<size_t>(n);
+    for (size_t i = 0; i + POKIINK_X3_FW_MAGIC_LEN <= total; ++i) {
+      if (buf[i] != needle0) continue;
+      if (std::memcmp(buf + i, POKIINK_X3_FW_MAGIC,
+                      static_cast<size_t>(POKIINK_X3_FW_MAGIC_LEN)) == 0) {
+        found = true;
+        break;
+      }
+    }
+    if (found) break;
+    // Carry the last (MAGIC_LEN - 1) bytes into the next iteration.
+    if (total >= OVERLAP) {
+      std::memmove(buf, buf + total - OVERLAP, OVERLAP);
+      carry = OVERLAP;
+    } else {
+      carry = total;
+    }
+    scanned += static_cast<size_t>(n);
+    esp_task_wdt_reset();
+  }
+  file.close();
+  return found;
+}
+
+FlashResult flashFromFile(const char* path, bool skipBoardCheck) {
   // Public wrapper around the private verifyAndFlash helper.  Same machinery,
   // exposed so the Settings → System → Update from SD activity can call it
   // with any user-picked .bin file (not just the auto-discovery filenames).
-  // The auto-recovery flow renames the source file to .applied on success so
-  // it doesn't trigger again next boot — we DON'T rename here because the
-  // user explicitly picked this file through a menu and may want to flash
-  // sibling devices from the same SD card.
-  return verifyAndFlash(path);
+  // The activity passes skipBoardCheck=true after the user explicitly
+  // confirms "Force install" on a previously-rejected wrong-board file.
+  return verifyAndFlash(path, skipBoardCheck);
 }
 
 void runIfRequested(bool forceRecoveryMode) {
@@ -317,7 +379,7 @@ void runIfRequested(bool forceRecoveryMode) {
     while (millis() < deadline) {
       if (const char* path = findCandidate()) {
         LOG_INF("RECOV", "Forced recovery: found %s — verifying", path);
-        if (verifyAndFlash(path)) {
+        if (verifyAndFlash(path) == FlashResult::SUCCESS) {
           LOG_INF("RECOV", "Forced recovery SUCCESS — rebooting in 2 seconds");
           delay(2000);
           ESP.restart();
@@ -348,7 +410,7 @@ void runIfRequested(bool forceRecoveryMode) {
   // not, we return immediately so the running firmware can boot normally.
   if (const char* path = findCandidate()) {
     LOG_INF("RECOV", "SD auto-recovery: found %s — attempting install", path);
-    if (verifyAndFlash(path)) {
+    if (verifyAndFlash(path) == FlashResult::SUCCESS) {
       LOG_INF("RECOV", "SD auto-recovery SUCCESS — rebooting in 2 seconds");
       delay(2000);
       ESP.restart();

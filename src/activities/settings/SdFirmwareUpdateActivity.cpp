@@ -103,36 +103,93 @@ void SdFirmwareUpdateActivity::enterConfirm() {
   requestUpdate();
 }
 
-void SdFirmwareUpdateActivity::performFlash() {
+void SdFirmwareUpdateActivity::performFlash(bool skipBoardCheck) {
+  // Two callers feed this:
+  //   1. The CONFIRM screen, with skipBoardCheck=false — normal flow.
+  //   2. The WRONG_BOARD screen, with skipBoardCheck=true — user explicitly
+  //      accepted the brick risk on a file that lacks the PokiInk magic.
+  //
+  // In case (2) the original file is still at its original SD path (we no
+  // longer rely on the .rejected.wrongboard rename trick — the pre-scan
+  // below catches wrong-board files BEFORE verifyAndFlash gets a chance
+  // to rename them, so the file is still at its original name when the
+  // user retries with force).
   if (selectedIndex < 0 || selectedIndex >= static_cast<int>(files.size())) {
     state = State::FAILED;
     failedReason = "Invalid selection";
     return;
   }
-
   flashingFilename = files[selectedIndex].name;
-  state = State::FLASHING;
+  const std::string fullPath = "/" + flashingFilename;
+
+  // Pre-flight magic scan — saves the user a 30-60 s wasted flash if the
+  // file is wrong-board.  Only do this on the non-forced path; if the user
+  // is already on the force path they've seen the warning and accepted.
+  if (!skipBoardCheck) {
+    requestUpdateAndWait();  // make sure the "Flashing..." screen is up
+    state = State::FLASHING;
+    requestUpdateAndWait();
+    if (!SdAutoRecovery::hasMagicInFile(fullPath.c_str())) {
+      LOG_INF("SDFW", "Pre-scan: PokiInk magic not found in %s — routing to "
+                       "WRONG_BOARD warning before any flash write",
+              fullPath.c_str());
+      state = State::WRONG_BOARD;
+      requestUpdate();
+      return;
+    }
+  }
+
+  state = skipBoardCheck ? State::FLASHING_FORCED : State::FLASHING;
   requestUpdateAndWait();  // ensure FLASHING screen renders before we block
 
-  const std::string fullPath = "/" + flashingFilename;
-  LOG_INF("SDFW", "User requested flash of %s", fullPath.c_str());
+  LOG_INF("SDFW", "User requested flash of %s (force=%d)", fullPath.c_str(),
+          skipBoardCheck ? 1 : 0);
 
-  const bool ok = SdAutoRecovery::flashFromFile(fullPath.c_str());
+  const SdAutoRecovery::FlashResult result =
+      SdAutoRecovery::flashFromFile(fullPath.c_str(), skipBoardCheck);
 
-  if (ok) {
+  if (result == SdAutoRecovery::FlashResult::SUCCESS) {
     state = State::REBOOTING;
     requestUpdateAndWait();
     delay(2500);    // hold the "Rebooting..." screen briefly so the user sees it
     ESP.restart();  // does not return
   }
 
+  if (result == SdAutoRecovery::FlashResult::WRONG_BOARD) {
+    // Special handling — this is the one recoverable rejection that the
+    // user can override.  Switch to the WRONG_BOARD state which surfaces
+    // a "Force install (DANGEROUS)" button instead of just "Back".
+    state = State::WRONG_BOARD;
+    requestUpdate();
+    return;
+  }
+
   state = State::FAILED;
-  // We don't have direct access to the .rejected.<reason> suffix that
-  // SdAutoRecovery wrote, but we know the file was renamed.  Tell the user
-  // to inspect the SD card on a PC and look for *.rejected.* if they want
-  // the specifics; the high-level reasons map cleanly to the suffix list
-  // documented in SdAutoRecovery.h.
-  failedReason = "Verification failed — see SD card for *.rejected.* file with reason";
+  // Map the enum to a user-readable reason — better than the generic
+  // "see SD for .rejected.*" message we used before.
+  switch (result) {
+    case SdAutoRecovery::FlashResult::OPEN_FAIL:
+      failedReason = "Could not open file";
+      break;
+    case SdAutoRecovery::FlashResult::SIZE_OUT_OF_RANGE:
+      failedReason = "File size out of range (256 KB .. 6 MB)";
+      break;
+    case SdAutoRecovery::FlashResult::BAD_HEADER:
+      failedReason = "Not a valid ESP32-C3 firmware (bad header magic)";
+      break;
+    case SdAutoRecovery::FlashResult::PARTITION_ERROR:
+      failedReason = "Flash partition error";
+      break;
+    case SdAutoRecovery::FlashResult::WRITE_FAIL:
+      failedReason = "Flash write failed";
+      break;
+    case SdAutoRecovery::FlashResult::OTADATA_FAIL:
+      failedReason = "Could not update boot pointer";
+      break;
+    default:
+      failedReason = "Verification failed";
+      break;
+  }
   requestUpdate();
 }
 
@@ -165,7 +222,26 @@ void SdFirmwareUpdateActivity::loop() {
       return;
     }
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-      performFlash();
+      performFlash(/*skipBoardCheck=*/false);
+    }
+    return;
+  }
+
+  if (state == State::WRONG_BOARD) {
+    if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+      // Reload the list — the file got renamed to .rejected.wrongboard by
+      // verifyAndFlash, so it won't appear in the list anymore unless the
+      // user renames it back via PC.  That's fine: it makes "back out and
+      // try again" a deliberate action.
+      loadFileList();
+      state = files.empty() ? State::EMPTY : State::LIST;
+      requestUpdate();
+      return;
+    }
+    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+      // User accepted the brick risk.  Retry with skipBoardCheck=true,
+      // pulling the file from its .rejected.wrongboard path.
+      performFlash(/*skipBoardCheck=*/true);
     }
     return;
   }
@@ -197,7 +273,7 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
 
   const auto lineH = renderer.getLineHeight(UI_10_FONT_ID);
 
-  if (state == State::FLASHING) {
+  if (state == State::FLASHING || state == State::FLASHING_FORCED) {
     const int top = (pageHeight - lineH * 3) / 2;
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_SD_FW_FLASHING), true, EpdFontFamily::BOLD);
     const std::string truncated =
@@ -206,6 +282,24 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
     renderer.drawCenteredText(SMALL_FONT_ID, top + lineH + metrics.verticalSpacing, truncated.c_str());
     renderer.drawCenteredText(SMALL_FONT_ID, top + lineH * 2 + metrics.verticalSpacing * 2,
                               tr(STR_SD_FW_DO_NOT_POWER_OFF));
+    renderer.displayBuffer();
+    return;
+  }
+  if (state == State::WRONG_BOARD) {
+    const int top = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing * 3;
+    int y = top;
+    renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_SD_FW_WRONG_BOARD_TITLE), true, EpdFontFamily::BOLD);
+    y += lineH + metrics.verticalSpacing * 2;
+    renderer.drawCenteredText(SMALL_FONT_ID, y, tr(STR_SD_FW_WRONG_BOARD_LINE_1));
+    y += lineH;
+    renderer.drawCenteredText(SMALL_FONT_ID, y, tr(STR_SD_FW_WRONG_BOARD_LINE_2));
+    y += lineH + metrics.verticalSpacing * 2;
+    renderer.drawCenteredText(SMALL_FONT_ID, y, tr(STR_SD_FW_WRONG_BOARD_LINE_3), true, EpdFontFamily::BOLD);
+    y += lineH;
+    renderer.drawCenteredText(SMALL_FONT_ID, y, tr(STR_SD_FW_WRONG_BOARD_LINE_4), true, EpdFontFamily::BOLD);
+
+    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_SD_FW_FORCE_INSTALL), "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();
     return;
   }
