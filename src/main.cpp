@@ -527,9 +527,31 @@ void setup() {
   // confirmation that recovery mode is active — without it, holding the
   // combo looks identical to a normal boot until the SD flash finishes,
   // and a user who misjudged the button timing would have no way to tell.
-  gpio.update();
-  const bool forceRecovery =
-      gpio.isPressed(HalGPIO::BTN_UP) && gpio.isPressed(HalGPIO::BTN_POWER);
+  // Poll the button state for ~100 ms looking for the UP+POWER combo.  We
+  // can't just call gpio.update() once and check — InputManager has a 5 ms
+  // debounce gate that requires the same raw state to be observed twice
+  // (across at least two update() calls separated by >5 ms) before it
+  // promotes the raw reading to the currentState bitmap that isPressed()
+  // reads.  A single update at this point shows nothing held even when
+  // the user is mashing both buttons (this was the 2.3.1-2.3.4 bug).
+  //
+  // 100 ms is also a small grace window for human timing — users typically
+  // start holding POWER first to wake the device, then add UP a frame
+  // later.  Polling for 100 ms catches that delayed UP press.  Boot path
+  // when nothing is held pays the same 100 ms; trivially small vs the
+  // ~3 s the rest of setup() takes, so no user impact.
+  bool forceRecovery = false;
+  {
+    const unsigned long pollStart = millis();
+    while (millis() - pollStart < 100) {
+      gpio.update();
+      if (gpio.isPressed(HalGPIO::BTN_UP) && gpio.isPressed(HalGPIO::BTN_POWER)) {
+        forceRecovery = true;
+        break;
+      }
+      delay(10);
+    }
+  }
   if (forceRecovery) {
     LOG_INF("MAIN", "UP+POWER held at boot — entering forced recovery mode");
     setupDisplayAndFonts();
